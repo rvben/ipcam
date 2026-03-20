@@ -1,11 +1,11 @@
 [package]
-name = "camctl"
+name = "ipcam"
 version = "0.0.1"
 edition = "2024"
 description = "A CLI for managing IP cameras (Tapo, Reolink) via RTSP and vendor APIs"
 license = "MIT"
-repository = "https://github.com/rvben/camctl"
-homepage = "https://github.com/rvben/camctl"
+repository = "https://github.com/rvben/ipcam"
+homepage = "https://github.com/rvben/ipcam"
 keywords = ["camera", "ip-camera", "rtsp", "tapo", "reolink"]
 categories = ["command-line-utilities"]
 readme = "README.md"

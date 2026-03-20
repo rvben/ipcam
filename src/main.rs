@@ -17,9 +17,9 @@ use camera::{MotionStatus, PtzDirection, StreamQuality};
 use clap::{CommandFactory, Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "camctl", about = "Manage IP cameras from the command line")]
+#[command(name = "ipcam", about = "Manage IP cameras from the command line")]
 struct Cli {
-    /// Path to config file (default: ~/.config/camctl/config.toml)
+    /// Path to config file (default: ~/.config/ipcam/config.toml)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
@@ -188,9 +188,9 @@ enum Command {
     ///
     /// Print a completion script to stdout and install it for your shell:
     ///
-    ///   camctl completions zsh  > ~/.zfunc/_camctl
-    ///   camctl completions bash > /etc/bash_completion.d/camctl
-    ///   camctl completions fish > ~/.config/fish/completions/camctl.fish
+    ///   ipcam completions zsh  > ~/.zfunc/_ipcam
+    ///   ipcam completions bash > /etc/bash_completion.d/ipcam
+    ///   ipcam completions fish > ~/.config/fish/completions/ipcam.fish
     Completions {
         /// Shell to generate completions for
         shell: clap_complete::Shell,
@@ -281,7 +281,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("camctl=info".parse().unwrap()),
+                .add_directive("ipcam=info".parse().unwrap()),
         )
         .init();
 
@@ -318,7 +318,7 @@ fn print_error(err: &anyhow::Error) {
         eprintln!("Hint: Check the username and password in your config file.");
     } else if msg.contains("not found in config") {
         eprintln!();
-        eprintln!("Hint: Run `camctl list` to see configured cameras.");
+        eprintln!("Hint: Run `ipcam list` to see configured cameras.");
     }
 
     if std::env::var("RUST_BACKTRACE").as_deref() == Ok("1")
@@ -707,7 +707,7 @@ async fn cmd_snapshot_grid(
 
     // Capture all cameras in parallel into a temp directory.
     let tmp_dir = std::env::temp_dir().join(format!(
-        "camctl-grid-{}",
+        "ipcam-grid-{}",
         chrono::Utc::now().timestamp()
     ));
     std::fs::create_dir_all(&tmp_dir)
@@ -1054,7 +1054,7 @@ async fn cmd_timelapse(
         }
         None => {
             let tmp = std::env::temp_dir().join(format!(
-                "camctl-timelapse-{}",
+                "ipcam-timelapse-{}",
                 chrono::Utc::now().timestamp()
             ));
             std::fs::create_dir_all(&tmp)
@@ -1511,7 +1511,7 @@ async fn cmd_frigate(config: &config::Config, action: FrigateAction, json: bool)
 
     match action {
         FrigateAction::Events { camera, limit } => {
-            // If user passes a camctl name, resolve its frigate_name
+            // If user passes a ipcam name, resolve its frigate_name
             let frigate_camera = camera.as_ref().map(|name| {
                 config
                     .find_camera(name)
@@ -1549,7 +1549,7 @@ async fn cmd_frigate(config: &config::Config, action: FrigateAction, json: bool)
             }
         }
         FrigateAction::Snapshot { camera, output } => {
-            // If user passes a camctl name, resolve its frigate_name
+            // If user passes a ipcam name, resolve its frigate_name
             let frigate_camera = config
                 .find_camera(&camera)
                 .map(|c| c.frigate_name())

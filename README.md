@@ -1,4 +1,4 @@
-# camctl
+# ipcam
 
 A command-line tool for managing IP cameras (Tapo, Reolink) via RTSP and vendor APIs.
 
@@ -37,39 +37,39 @@ cargo install --path .
 Run the interactive setup wizard to discover cameras on your network and generate a config file:
 
 ```bash
-camctl init
+ipcam init
 ```
 
 Or use `--auto` to skip prompts and generate a config from detected cameras:
 
 ```bash
-camctl init --auto
+ipcam init --auto
 ```
 
 Once configured, a few common commands:
 
 ```bash
 # List configured cameras
-camctl list
+ipcam list
 
 # Capture a snapshot
-camctl snapshot front-door
+ipcam snapshot front-door
 
 # Check all cameras are reachable
-camctl status
+ipcam status
 
 # Run an end-to-end test on all cameras
-camctl test
+ipcam test
 ```
 
 ## Configuration
 
 The config file is TOML and lives at:
 
-- **macOS:** `~/Library/Application Support/camctl/config.toml`
-- **Linux:** `~/.config/camctl/config.toml`
+- **macOS:** `~/Library/Application Support/ipcam/config.toml`
+- **Linux:** `~/.config/ipcam/config.toml`
 
-Run `camctl config` to print the exact path on your system.
+Run `ipcam config` to print the exact path on your system.
 
 ### Example config
 
@@ -153,45 +153,45 @@ All commands accept `--json` for machine-readable output and `--config <path>` t
 
 ```bash
 # Single camera, default filename (<camera>_<timestamp>.jpg)
-camctl snapshot front-door
+ipcam snapshot front-door
 
 # Single camera, custom output path
-camctl snapshot front-door --output /tmp/front.jpg
+ipcam snapshot front-door --output /tmp/front.jpg
 
 # All cameras saved to a directory
-camctl snapshot --all --output-dir /tmp/cams/
+ipcam snapshot --all --output-dir /tmp/cams/
 
 # Tiled grid of all cameras
-camctl snapshot --grid --output-dir /tmp/
+ipcam snapshot --grid --output-dir /tmp/
 
 # Capture every 5 minutes, save timestamped files
-camctl snapshot front-door --every 5m --output-dir /tmp/front-door/
+ipcam snapshot front-door --every 5m --output-dir /tmp/front-door/
 ```
 
 ### Status and test
 
 ```bash
 # Check all cameras
-camctl status
+ipcam status
 
 # Check a single camera
-camctl status front-door
+ipcam status front-door
 
 # Full end-to-end test (network + RTSP + snapshot)
-camctl test
+ipcam test
 
 # Test a single camera, JSON output
-camctl test front-door --json
+ipcam test front-door --json
 ```
 
 ### Watch
 
 ```bash
 # Poll every 30 s, print status changes to stdout
-camctl watch
+ipcam watch
 
 # Poll every minute, run a script on any status change
-camctl watch --interval 1m --exec 'notify-send "$CAMERA_NAME is $CAMERA_STATUS"'
+ipcam watch --interval 1m --exec 'notify-send "$CAMERA_NAME is $CAMERA_STATUS"'
 ```
 
 The `--exec` command receives these environment variables:
@@ -207,10 +207,10 @@ The `--exec` command receives these environment variables:
 
 ```bash
 # 1-hour capture with a snapshot every 30 s, encoded to timelapse.mp4
-camctl timelapse front-door --interval 30s --duration 1h --output front-door.mp4
+ipcam timelapse front-door --interval 30s --duration 1h --output front-door.mp4
 
 # Keep individual frames as well
-camctl timelapse front-door --interval 1m --duration 4h \
+ipcam timelapse front-door --interval 1m --duration 4h \
   --output timelapse.mp4 --output-dir ./frames/
 ```
 
@@ -218,29 +218,29 @@ camctl timelapse front-door --interval 1m --duration 4h \
 
 ```bash
 # zsh
-camctl completions zsh > ~/.zfunc/_camctl
+ipcam completions zsh > ~/.zfunc/_ipcam
 
 # bash
-camctl completions bash > /etc/bash_completion.d/camctl
+ipcam completions bash > /etc/bash_completion.d/ipcam
 
 # fish
-camctl completions fish > ~/.config/fish/completions/camctl.fish
+ipcam completions fish > ~/.config/fish/completions/ipcam.fish
 ```
 
 ### PTZ control
 
 ```bash
 # Pan left at speed 5 (default)
-camctl ptz backyard left
+ipcam ptz backyard left
 
 # Tilt up at speed 8
-camctl ptz backyard up --speed 8
+ipcam ptz backyard up --speed 8
 
 # Go to preset position 1
-camctl ptz backyard preset 1
+ipcam ptz backyard preset 1
 
 # Stop movement
-camctl ptz backyard stop
+ipcam ptz backyard stop
 ```
 
 ## Supported Cameras
@@ -266,7 +266,7 @@ camctl ptz backyard stop
 
 ### go2rtc
 
-If your cameras are behind a [go2rtc](https://github.com/AlexxIT/go2rtc) restream proxy, add a `[go2rtc]` section to your config and set `go2rtc_stream` on each camera. camctl will use the proxy RTSP URL (`rtsp://<host>:<port>/<stream>`) instead of connecting to the camera directly.
+If your cameras are behind a [go2rtc](https://github.com/AlexxIT/go2rtc) restream proxy, add a `[go2rtc]` section to your config and set `go2rtc_stream` on each camera. ipcam will use the proxy RTSP URL (`rtsp://<host>:<port>/<stream>`) instead of connecting to the camera directly.
 
 Sub-stream URLs are constructed by appending `_sub` to the stream name (e.g. `backyard_sub`).
 
@@ -276,16 +276,16 @@ Add a `[frigate]` section to your config pointing at your [Frigate](https://frig
 
 ```bash
 # List the 20 most recent events across all cameras
-camctl frigate events --limit 20
+ipcam frigate events --limit 20
 
 # Filter by camera
-camctl frigate events --camera front_door
+ipcam frigate events --camera front_door
 
 # Save the latest Frigate snapshot for a camera
-camctl frigate snapshot front_door --output /tmp/latest.jpg
+ipcam frigate snapshot front_door --output /tmp/latest.jpg
 ```
 
-Frigate camera names use underscores (e.g. `front_door`). Set `frigate_name` in the camera config if the name differs from your camctl name.
+Frigate camera names use underscores (e.g. `front_door`). Set `frigate_name` in the camera config if the name differs from your ipcam name.
 
 ## License
 

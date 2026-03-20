@@ -133,32 +133,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
-name = "camctl"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64",
- "chrono",
- "clap",
- "clap_complete",
- "dirs",
- "futures",
- "humantime",
- "quick-xml",
- "rand",
- "reqwest",
- "serde",
- "serde_json",
- "sha1",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
 name = "cc"
 version = "1.2.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -843,6 +817,32 @@ dependencies = [
  "hashbrown 0.16.1",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "ipcam"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "chrono",
+ "clap",
+ "clap_complete",
+ "dirs",
+ "futures",
+ "humantime",
+ "quick-xml",
+ "rand",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha1",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

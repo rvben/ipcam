@@ -28,8 +28,8 @@ install:
 
 completions:
 	mkdir -p completions
-	cargo run -- completions bash > completions/camctl.bash
-	cargo run -- completions zsh > completions/_camctl
-	cargo run -- completions fish > completions/camctl.fish
+	cargo run -- completions bash > completions/ipcam.bash
+	cargo run -- completions zsh > completions/_ipcam
+	cargo run -- completions fish > completions/ipcam.fish
 
 ci: lint test release
