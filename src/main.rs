@@ -66,6 +66,10 @@ enum Command {
         /// Capture repeatedly at this interval (e.g. "30s", "5m", "1h"); saves timestamped files
         #[arg(long, conflicts_with_all = ["all", "grid"])]
         every: Option<String>,
+
+        /// Stamp the camera name and timestamp onto the image using ffmpeg drawtext
+        #[arg(long)]
+        label: bool,
     },
 
     /// Capture snapshots from all configured cameras in parallel
@@ -343,11 +347,12 @@ async fn run() -> Result<()> {
             grid,
             output_dir,
             every,
+            label,
         } => {
             if grid {
-                cmd_snapshot_grid(&config, output_dir).await
+                cmd_snapshot_grid(&config, output_dir, label).await
             } else if all {
-                cmd_snapshot_all(&config, output_dir, cli.json).await
+                cmd_snapshot_all(&config, output_dir, cli.json, label).await
             } else if let Some(interval_str) = every {
                 let name = camera
                     .ok_or_else(|| anyhow::anyhow!("camera name is required when using --every"))?;
@@ -360,11 +365,11 @@ async fn run() -> Result<()> {
                         "camera name is required (or use --all to snapshot all cameras)"
                     )
                 })?;
-                cmd_snapshot(&config, &name, output).await
+                cmd_snapshot(&config, &name, output, label).await
             }
         }
         Command::SnapshotAll { output_dir } => {
-            cmd_snapshot_all(&config, output_dir, cli.json).await
+            cmd_snapshot_all(&config, output_dir, cli.json, false).await
         }
         Command::Stream {
             camera,
@@ -465,7 +470,51 @@ async fn cmd_info(config: &config::Config, name: &str, json: bool) -> Result<()>
     Ok(())
 }
 
-async fn cmd_snapshot(config: &config::Config, name: &str, output: Option<PathBuf>) -> Result<()> {
+/// Stamp the camera name and timestamp onto an image file using ffmpeg's drawtext filter.
+///
+/// The text is rendered near the bottom-left of the image with a black border for legibility.
+/// The file is overwritten in-place.
+async fn apply_label(path: &std::path::Path, camera_name: &str, timestamp: &str) -> Result<()> {
+    // Colons in the drawtext text value must be escaped as `\:`.
+    let escaped_ts = timestamp.replace(':', r"\:");
+    let text = format!("{}  {}", camera_name, escaped_ts);
+    let drawtext = format!(
+        "drawtext=text='{}':fontsize=28:fontcolor=white:borderw=2:bordercolor=black:x=10:y=h-th-10",
+        text
+    );
+
+    // Write to a temporary file alongside the original, then rename atomically.
+    let tmp_path = path.with_extension("_label_tmp.jpg");
+
+    let status = tokio::process::Command::new("ffmpeg")
+        .args(["-loglevel", "error", "-i"])
+        .arg(path)
+        .args(["-vf", &drawtext, "-update", "1", "-y"])
+        .arg(&tmp_path)
+        .status()
+        .await
+        .context("failed to run ffmpeg — is it installed?")?;
+
+    if !status.success() {
+        let _ = std::fs::remove_file(&tmp_path);
+        eprintln!(
+            "Warning: --label failed (ffmpeg drawtext filter unavailable; install ffmpeg with libfreetype support). Saving without label."
+        );
+        return Ok(());
+    }
+
+    std::fs::rename(&tmp_path, path)
+        .with_context(|| format!("renaming labelled image to {}", path.display()))?;
+
+    Ok(())
+}
+
+async fn cmd_snapshot(
+    config: &config::Config,
+    name: &str,
+    output: Option<PathBuf>,
+    label: bool,
+) -> Result<()> {
     let cam_config = config
         .find_camera(name)
         .with_context(|| format!("camera '{}' not found in config", name))?;
@@ -474,8 +523,9 @@ async fn cmd_snapshot(config: &config::Config, name: &str, output: Option<PathBu
     tracing::info!("capturing snapshot from '{}'...", name);
     let snapshot = cam.snapshot().await?;
 
+    let ts = snapshot.timestamp.format("%Y%m%d_%H%M%S").to_string();
+
     let path = output.unwrap_or_else(|| {
-        let ts = snapshot.timestamp.format("%Y%m%d_%H%M%S");
         PathBuf::from(format!(
             "{}_{}.{}",
             snapshot.camera_name,
@@ -485,6 +535,12 @@ async fn cmd_snapshot(config: &config::Config, name: &str, output: Option<PathBu
     });
 
     std::fs::write(&path, &snapshot.data)?;
+
+    if label {
+        let display_ts = snapshot.timestamp.format("%Y-%m-%d %H:%M:%S").to_string();
+        apply_label(&path, name, &display_ts).await?;
+    }
+
     println!("Saved snapshot to {}", path.display());
     Ok(())
 }
@@ -493,6 +549,7 @@ async fn cmd_snapshot_all(
     config: &config::Config,
     output_dir: Option<PathBuf>,
     json: bool,
+    label: bool,
 ) -> Result<()> {
     if config.cameras.is_empty() {
         if json {
@@ -522,7 +579,7 @@ async fn cmd_snapshot_all(
                 tracing::info!("capturing snapshot from '{}'...", name);
                 match cam.snapshot().await {
                     Ok(snapshot) => {
-                        let ts = snapshot.timestamp.format("%Y%m%d_%H%M%S");
+                        let ts = snapshot.timestamp.format("%Y%m%d_%H%M%S").to_string();
                         let filename = format!(
                             "{}_{}.{}",
                             snapshot.camera_name,
@@ -531,7 +588,18 @@ async fn cmd_snapshot_all(
                         );
                         let path = dir.join(&filename);
                         match std::fs::write(&path, &snapshot.data) {
-                            Ok(()) => (name, Ok(path)),
+                            Ok(()) => {
+                                if label {
+                                    let display_ts = snapshot
+                                        .timestamp
+                                        .format("%Y-%m-%d %H:%M:%S")
+                                        .to_string();
+                                    if let Err(e) = apply_label(&path, &name, &display_ts).await {
+                                        return (name, Err(e));
+                                    }
+                                }
+                                (name, Ok(path))
+                            }
                             Err(e) => (name, Err(anyhow::anyhow!("write failed: {e}"))),
                         }
                     }
@@ -600,6 +668,7 @@ async fn cmd_snapshot_all(
 async fn cmd_snapshot_grid(
     config: &config::Config,
     output_dir: Option<PathBuf>,
+    label: bool,
 ) -> Result<()> {
     if config.cameras.is_empty() {
         println!("No cameras configured.");
@@ -790,6 +859,11 @@ async fn cmd_snapshot_grid(
 
     if !status.success() {
         bail!("ffmpeg exited with status {}", status);
+    }
+
+    if label {
+        let display_ts = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        apply_label(&output_path, "grid", &display_ts).await?;
     }
 
     println!("Saved grid snapshot to {}", output_path.display());
