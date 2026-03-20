@@ -1,9 +1,9 @@
-.PHONY: build build-release run test lint fmt check clean
+.PHONY: build release run test lint fmt check clean install completions ci
 
 build:
 	cargo build
 
-build-release:
+release:
 	cargo build --release
 
 run:
@@ -22,3 +22,14 @@ check: fmt lint test
 
 clean:
 	cargo clean
+
+install:
+	cargo install --path .
+
+completions:
+	mkdir -p completions
+	cargo run -- completions bash > completions/camera-cli.bash
+	cargo run -- completions zsh > completions/_camera-cli
+	cargo run -- completions fish > completions/camera-cli.fish
+
+ci: lint test release
