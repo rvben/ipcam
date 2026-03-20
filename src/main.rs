@@ -228,6 +228,46 @@ enum Command {
         /// New camera name
         new_name: String,
     },
+
+    /// Manually add a camera to the config
+    Add {
+        /// IP address of the camera
+        host: String,
+
+        /// Camera name (default: auto-generated from last octet, e.g. "camera-215")
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Camera type
+        #[arg(long, value_name = "TYPE")]
+        r#type: CameraTypeArg,
+
+        /// Username (default: admin)
+        #[arg(long, default_value = "admin")]
+        username: String,
+
+        /// Password
+        #[arg(long)]
+        password: Option<String>,
+
+        /// RTSP port (default: 554)
+        #[arg(long, default_value = "554")]
+        rtsp_port: u16,
+
+        /// go2rtc stream name
+        #[arg(long)]
+        go2rtc_stream: Option<String>,
+    },
+
+    /// Remove a camera from the config
+    Remove {
+        /// Camera name to remove
+        name: String,
+
+        /// Skip confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -238,6 +278,21 @@ enum PtzAction {
     Down,
     Stop,
     Preset,
+}
+
+#[derive(Debug, Clone, clap::ValueEnum)]
+enum CameraTypeArg {
+    Tapo,
+    Reolink,
+}
+
+impl From<CameraTypeArg> for config::CameraType {
+    fn from(arg: CameraTypeArg) -> Self {
+        match arg {
+            CameraTypeArg::Tapo => config::CameraType::Tapo,
+            CameraTypeArg::Reolink => config::CameraType::Reolink,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -358,6 +413,7 @@ async fn run() -> Result<()> {
         return init::run_init(auto).await;
     }
 
+    config::Config::migrate_if_needed()?;
     let config = config::Config::load()?;
 
     match cli.command {
@@ -437,6 +493,16 @@ async fn run() -> Result<()> {
         }
         Command::Test { camera } => cmd_test(&config, camera.as_deref(), cli.json).await,
         Command::Rename { old_name, new_name } => cmd_rename(&old_name, &new_name),
+        Command::Add {
+            host,
+            name,
+            r#type,
+            username,
+            password,
+            rtsp_port,
+            go2rtc_stream,
+        } => cmd_add(&host, name.as_deref(), r#type, &username, password.as_deref(), rtsp_port, go2rtc_stream.as_deref()),
+        Command::Remove { name, yes } => cmd_remove(&name, yes),
         Command::Completions { .. } | Command::Init { .. } => {
             unreachable!("handled before config load")
         }
@@ -1826,6 +1892,115 @@ async fn cmd_test(config: &config::Config, camera: Option<&str>, json: bool) -> 
             println!();
         }
     }
+
+    Ok(())
+}
+
+fn cmd_add(
+    host: &str,
+    name: Option<&str>,
+    camera_type_arg: CameraTypeArg,
+    username: &str,
+    password: Option<&str>,
+    rtsp_port: u16,
+    go2rtc_stream: Option<&str>,
+) -> Result<()> {
+    let mut config = config::Config::load()?;
+
+    // Auto-generate name from last octet if not provided.
+    let resolved_name = match name {
+        Some(n) => n.to_string(),
+        None => {
+            let last_octet = host
+                .rsplit('.')
+                .next()
+                .unwrap_or(host)
+                .split(':')
+                .next()
+                .unwrap_or(host);
+            format!("camera-{}", last_octet)
+        }
+    };
+
+    if config.cameras.iter().any(|c| c.name == resolved_name) {
+        bail!("a camera named '{}' already exists in config", resolved_name);
+    }
+
+    if config.cameras.iter().any(|c| c.host == host) {
+        bail!("a camera with host '{}' already exists in config", host);
+    }
+
+    let camera_type = config::CameraType::from(camera_type_arg);
+
+    let new_camera = config::CameraConfig {
+        name: resolved_name.clone(),
+        camera_type,
+        host: host.to_string(),
+        rtsp_port,
+        username: if username.is_empty() {
+            None
+        } else {
+            Some(username.to_string())
+        },
+        password: password.map(|p| p.to_string()),
+        go2rtc_stream: go2rtc_stream.map(|s| s.to_string()),
+        onvif_port: None,
+        frigate_name: None,
+    };
+
+    config.cameras.push(new_camera);
+
+    let path = config::Config::config_path()?;
+    let content = toml::to_string_pretty(&config).context("serializing config")?;
+    std::fs::write(&path, content)
+        .with_context(|| format!("writing {}", path.display()))?;
+
+    println!(
+        "Added camera '{}' ({} @ {})",
+        resolved_name, camera_type, host
+    );
+
+    Ok(())
+}
+
+fn cmd_remove(name: &str, yes: bool) -> Result<()> {
+    let mut config = config::Config::load()?;
+
+    let pos = config
+        .cameras
+        .iter()
+        .position(|c| c.name == name)
+        .with_context(|| format!("camera '{}' not found in config", name))?;
+
+    let cam = &config.cameras[pos];
+    println!(
+        "Will remove: '{}' ({} @ {})",
+        cam.name, cam.camera_type, cam.host
+    );
+
+    if !yes {
+        use std::io::Write as _;
+        print!("Confirm removal? [y/N]: ");
+        std::io::stdout().flush().context("flush stdout")?;
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("read from stdin")?;
+        let answer = line.trim().to_lowercase();
+        if answer != "y" && answer != "yes" {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    config.cameras.remove(pos);
+
+    let path = config::Config::config_path()?;
+    let content = toml::to_string_pretty(&config).context("serializing config")?;
+    std::fs::write(&path, content)
+        .with_context(|| format!("writing {}", path.display()))?;
+
+    println!("Removed camera '{}'.", name);
 
     Ok(())
 }
