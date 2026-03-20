@@ -1,4 +1,4 @@
-# camera-cli
+# camctl
 
 A command-line tool for managing IP cameras (Tapo, Reolink) via RTSP and vendor APIs.
 
@@ -37,39 +37,39 @@ cargo install --path .
 Run the interactive setup wizard to discover cameras on your network and generate a config file:
 
 ```bash
-camera-cli init
+camctl init
 ```
 
 Or use `--auto` to skip prompts and generate a config from detected cameras:
 
 ```bash
-camera-cli init --auto
+camctl init --auto
 ```
 
 Once configured, a few common commands:
 
 ```bash
 # List configured cameras
-camera-cli list
+camctl list
 
 # Capture a snapshot
-camera-cli snapshot front-door
+camctl snapshot front-door
 
 # Check all cameras are reachable
-camera-cli status
+camctl status
 
 # Run an end-to-end test on all cameras
-camera-cli test
+camctl test
 ```
 
 ## Configuration
 
 The config file is TOML and lives at:
 
-- **macOS:** `~/Library/Application Support/camera-cli/config.toml`
-- **Linux:** `~/.config/camera-cli/config.toml`
+- **macOS:** `~/Library/Application Support/camctl/config.toml`
+- **Linux:** `~/.config/camctl/config.toml`
 
-Run `camera-cli config` to print the exact path on your system.
+Run `camctl config` to print the exact path on your system.
 
 ### Example config
 
@@ -153,45 +153,45 @@ All commands accept `--json` for machine-readable output and `--config <path>` t
 
 ```bash
 # Single camera, default filename (<camera>_<timestamp>.jpg)
-camera-cli snapshot front-door
+camctl snapshot front-door
 
 # Single camera, custom output path
-camera-cli snapshot front-door --output /tmp/front.jpg
+camctl snapshot front-door --output /tmp/front.jpg
 
 # All cameras saved to a directory
-camera-cli snapshot --all --output-dir /tmp/cams/
+camctl snapshot --all --output-dir /tmp/cams/
 
 # Tiled grid of all cameras
-camera-cli snapshot --grid --output-dir /tmp/
+camctl snapshot --grid --output-dir /tmp/
 
 # Capture every 5 minutes, save timestamped files
-camera-cli snapshot front-door --every 5m --output-dir /tmp/front-door/
+camctl snapshot front-door --every 5m --output-dir /tmp/front-door/
 ```
 
 ### Status and test
 
 ```bash
 # Check all cameras
-camera-cli status
+camctl status
 
 # Check a single camera
-camera-cli status front-door
+camctl status front-door
 
 # Full end-to-end test (network + RTSP + snapshot)
-camera-cli test
+camctl test
 
 # Test a single camera, JSON output
-camera-cli test front-door --json
+camctl test front-door --json
 ```
 
 ### Watch
 
 ```bash
 # Poll every 30 s, print status changes to stdout
-camera-cli watch
+camctl watch
 
 # Poll every minute, run a script on any status change
-camera-cli watch --interval 1m --exec 'notify-send "$CAMERA_NAME is $CAMERA_STATUS"'
+camctl watch --interval 1m --exec 'notify-send "$CAMERA_NAME is $CAMERA_STATUS"'
 ```
 
 The `--exec` command receives these environment variables:
@@ -207,10 +207,10 @@ The `--exec` command receives these environment variables:
 
 ```bash
 # 1-hour capture with a snapshot every 30 s, encoded to timelapse.mp4
-camera-cli timelapse front-door --interval 30s --duration 1h --output front-door.mp4
+camctl timelapse front-door --interval 30s --duration 1h --output front-door.mp4
 
 # Keep individual frames as well
-camera-cli timelapse front-door --interval 1m --duration 4h \
+camctl timelapse front-door --interval 1m --duration 4h \
   --output timelapse.mp4 --output-dir ./frames/
 ```
 
@@ -218,29 +218,29 @@ camera-cli timelapse front-door --interval 1m --duration 4h \
 
 ```bash
 # zsh
-camera-cli completions zsh > ~/.zfunc/_camera-cli
+camctl completions zsh > ~/.zfunc/_camctl
 
 # bash
-camera-cli completions bash > /etc/bash_completion.d/camera-cli
+camctl completions bash > /etc/bash_completion.d/camctl
 
 # fish
-camera-cli completions fish > ~/.config/fish/completions/camera-cli.fish
+camctl completions fish > ~/.config/fish/completions/camctl.fish
 ```
 
 ### PTZ control
 
 ```bash
 # Pan left at speed 5 (default)
-camera-cli ptz backyard left
+camctl ptz backyard left
 
 # Tilt up at speed 8
-camera-cli ptz backyard up --speed 8
+camctl ptz backyard up --speed 8
 
 # Go to preset position 1
-camera-cli ptz backyard preset 1
+camctl ptz backyard preset 1
 
 # Stop movement
-camera-cli ptz backyard stop
+camctl ptz backyard stop
 ```
 
 ## Supported Cameras
@@ -266,7 +266,7 @@ camera-cli ptz backyard stop
 
 ### go2rtc
 
-If your cameras are behind a [go2rtc](https://github.com/AlexxIT/go2rtc) restream proxy, add a `[go2rtc]` section to your config and set `go2rtc_stream` on each camera. camera-cli will use the proxy RTSP URL (`rtsp://<host>:<port>/<stream>`) instead of connecting to the camera directly.
+If your cameras are behind a [go2rtc](https://github.com/AlexxIT/go2rtc) restream proxy, add a `[go2rtc]` section to your config and set `go2rtc_stream` on each camera. camctl will use the proxy RTSP URL (`rtsp://<host>:<port>/<stream>`) instead of connecting to the camera directly.
 
 Sub-stream URLs are constructed by appending `_sub` to the stream name (e.g. `backyard_sub`).
 
@@ -276,16 +276,16 @@ Add a `[frigate]` section to your config pointing at your [Frigate](https://frig
 
 ```bash
 # List the 20 most recent events across all cameras
-camera-cli frigate events --limit 20
+camctl frigate events --limit 20
 
 # Filter by camera
-camera-cli frigate events --camera front_door
+camctl frigate events --camera front_door
 
 # Save the latest Frigate snapshot for a camera
-camera-cli frigate snapshot front_door --output /tmp/latest.jpg
+camctl frigate snapshot front_door --output /tmp/latest.jpg
 ```
 
-Frigate camera names use underscores (e.g. `front_door`). Set `frigate_name` in the camera config if the name differs from your camera-cli name.
+Frigate camera names use underscores (e.g. `front_door`). Set `frigate_name` in the camera config if the name differs from your camctl name.
 
 ## License
 

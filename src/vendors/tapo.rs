@@ -137,7 +137,7 @@ impl Camera for TapoCamera {
 
     async fn snapshot(&self) -> Result<Snapshot> {
         let rtsp_url = self.effective_rtsp_url(StreamQuality::Sub);
-        let tmp = std::env::temp_dir().join(format!("camera-cli-{}.jpg", self.name));
+        let tmp = std::env::temp_dir().join(format!("camctl-{}.jpg", self.name));
 
         let output = tokio::process::Command::new("ffmpeg")
             .args([

@@ -1,5 +1,5 @@
 [package]
-name = "camera-cli"
+name = "camctl"
 version = "0.1.0"
 edition = "2024"
 description = "A CLI for managing IP cameras (Tapo, Reolink) via RTSP and vendor APIs"

@@ -121,7 +121,7 @@ impl Config {
     pub fn config_path() -> Result<PathBuf> {
         let config_dir = dirs::config_dir()
             .context("could not determine config directory")?
-            .join("camera-cli");
+            .join("camctl");
         Ok(config_dir.join("config.toml"))
     }
 
