@@ -1,0 +1,584 @@
+mod camera;
+mod config;
+mod discovery;
+mod vendors;
+
+use std::path::PathBuf;
+
+use anyhow::{Context, Result, bail};
+use camera::{MotionStatus, StreamQuality};
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(name = "camera-cli", about = "Manage IP cameras from the command line")]
+struct Cli {
+    /// Path to config file (default: ~/.config/camera-cli/config.toml)
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+
+    /// Output as JSON
+    #[arg(long, global = true)]
+    json: bool,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// List configured cameras
+    List,
+
+    /// Get camera info
+    Info {
+        /// Camera name from config
+        camera: String,
+    },
+
+    /// Capture a snapshot from a camera
+    Snapshot {
+        /// Camera name from config (omit with --all to snapshot all cameras)
+        camera: Option<String>,
+
+        /// Output file path (default: <camera>_<timestamp>.jpg)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Snapshot all configured cameras (alias for snapshot-all)
+        #[arg(long, conflicts_with_all = ["camera", "output"])]
+        all: bool,
+
+        /// Directory to save snapshots when using --all (default: current directory)
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
+    },
+
+    /// Capture snapshots from all configured cameras in parallel
+    SnapshotAll {
+        /// Directory to save snapshots (default: current directory)
+        #[arg(short, long)]
+        output_dir: Option<PathBuf>,
+    },
+
+    /// Print the RTSP stream URL for a camera
+    Stream {
+        /// Camera name from config
+        camera: String,
+
+        /// Stream quality
+        #[arg(short, long, default_value = "main")]
+        quality: StreamQuality,
+
+        /// Pipe stream to file using ffmpeg
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Recording duration in seconds (used with --output)
+        #[arg(short, long, default_value = "10")]
+        duration: u64,
+    },
+
+    /// Record a clip from a camera
+    Record {
+        /// Camera name from config
+        camera: String,
+
+        /// Output file path
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Duration in seconds
+        #[arg(short, long, default_value = "30")]
+        duration: u64,
+    },
+
+    /// Show the config file path and status
+    Config,
+
+    /// Discover cameras on the local network via ONVIF WS-Discovery
+    Discover {
+        /// How long to wait for responses (seconds)
+        #[arg(short, long, default_value = "3")]
+        timeout: u64,
+    },
+
+    /// Watch for motion and doorbell events
+    Events {
+        /// Camera name from config
+        camera: String,
+
+        /// Poll continuously and print events as they happen
+        #[arg(short, long)]
+        watch: bool,
+    },
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("camera_cli=info".parse().unwrap()),
+        )
+        .init();
+
+    if let Err(err) = run().await {
+        print_error(&err);
+        std::process::exit(1);
+    }
+}
+
+fn print_error(err: &anyhow::Error) {
+    eprintln!("Error: {err}");
+
+    let mut source = err.source();
+    while let Some(cause) = source {
+        eprintln!("  caused by: {cause}");
+        source = cause.source();
+    }
+
+    let msg = format!("{err:#}").to_lowercase();
+    if msg.contains("connection refused")
+        || msg.contains("timed out")
+        || msg.contains("no route to host")
+        || msg.contains("network unreachable")
+    {
+        eprintln!();
+        eprintln!("Hint: Check that the camera is online and reachable on the network.");
+    } else if msg.contains("401")
+        || msg.contains("403")
+        || msg.contains("unauthorized")
+        || msg.contains("authentication")
+        || msg.contains("wrong password")
+    {
+        eprintln!();
+        eprintln!("Hint: Check the username and password in your config file.");
+    } else if msg.contains("not found in config") {
+        eprintln!();
+        eprintln!("Hint: Run `camera-cli list` to see configured cameras.");
+    }
+
+    if std::env::var("RUST_BACKTRACE").as_deref() == Ok("1")
+        || std::env::var("RUST_BACKTRACE").as_deref() == Ok("full")
+    {
+        let bt = err.backtrace();
+        let bt_str = bt.to_string();
+        if !bt_str.is_empty() && bt_str != "disabled backtrace" {
+            eprintln!();
+            eprintln!("{bt_str}");
+        }
+    }
+}
+
+async fn run() -> Result<()> {
+    let cli = Cli::parse();
+    let config = config::Config::load()?;
+
+    match cli.command {
+        Command::List => cmd_list(&config, cli.json),
+        Command::Info { camera } => cmd_info(&config, &camera, cli.json).await,
+        Command::Snapshot {
+            camera,
+            output,
+            all,
+            output_dir,
+        } => {
+            if all {
+                cmd_snapshot_all(&config, output_dir, cli.json).await
+            } else {
+                let name = camera.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "camera name is required (or use --all to snapshot all cameras)"
+                    )
+                })?;
+                cmd_snapshot(&config, &name, output).await
+            }
+        }
+        Command::SnapshotAll { output_dir } => {
+            cmd_snapshot_all(&config, output_dir, cli.json).await
+        }
+        Command::Stream {
+            camera,
+            quality,
+            output,
+            duration,
+        } => cmd_stream(&config, &camera, quality, output, duration).await,
+        Command::Record {
+            camera,
+            output,
+            duration,
+        } => cmd_record(&config, &camera, output, duration).await,
+        Command::Config => cmd_config(),
+        Command::Discover { timeout } => cmd_discover(timeout, cli.json).await,
+        Command::Events { camera, watch } => cmd_events(&config, &camera, watch, cli.json).await,
+    }
+}
+
+fn cmd_list(config: &config::Config, json: bool) -> Result<()> {
+    if config.cameras.is_empty() {
+        if json {
+            println!("[]");
+        } else {
+            let config_path = config::Config::config_path()?;
+            println!("No cameras configured.");
+            println!("Add cameras to: {}", config_path.display());
+        }
+        return Ok(());
+    }
+
+    if json {
+        let cameras: Vec<_> = config
+            .cameras
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "name": c.name,
+                    "type": c.camera_type.to_string(),
+                    "host": c.host,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&cameras)?);
+    } else {
+        for cam in &config.cameras {
+            println!("{:<20} {:<10} {}", cam.name, cam.camera_type, cam.host);
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_info(config: &config::Config, name: &str, json: bool) -> Result<()> {
+    let cam_config = config
+        .find_camera(name)
+        .with_context(|| format!("camera '{}' not found in config", name))?;
+    let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
+    let info = cam.info().await?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&info)?);
+    } else {
+        println!("Name:     {}", info.name);
+        println!("Host:     {}", info.host);
+        if let Some(model) = &info.model {
+            println!("Model:    {}", model);
+        }
+        if let Some(fw) = &info.firmware {
+            println!("Firmware: {}", fw);
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_snapshot(config: &config::Config, name: &str, output: Option<PathBuf>) -> Result<()> {
+    let cam_config = config
+        .find_camera(name)
+        .with_context(|| format!("camera '{}' not found in config", name))?;
+    let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
+
+    tracing::info!("capturing snapshot from '{}'...", name);
+    let snapshot = cam.snapshot().await?;
+
+    let path = output.unwrap_or_else(|| {
+        let ts = snapshot.timestamp.format("%Y%m%d_%H%M%S");
+        PathBuf::from(format!(
+            "{}_{}.{}",
+            snapshot.camera_name,
+            ts,
+            snapshot.format.extension()
+        ))
+    });
+
+    std::fs::write(&path, &snapshot.data)?;
+    println!("Saved snapshot to {}", path.display());
+    Ok(())
+}
+
+async fn cmd_snapshot_all(
+    config: &config::Config,
+    output_dir: Option<PathBuf>,
+    json: bool,
+) -> Result<()> {
+    if config.cameras.is_empty() {
+        if json {
+            println!("{}", serde_json::json!({"successes": [], "failures": []}));
+        } else {
+            println!("No cameras configured.");
+        }
+        return Ok(());
+    }
+
+    let dir = output_dir.unwrap_or_else(|| PathBuf::from("."));
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating output directory: {}", dir.display()))?;
+
+    let futures: Vec<_> = config
+        .cameras
+        .iter()
+        .map(|cam_config| {
+            let name = cam_config.name.clone();
+            let dir = dir.clone();
+            let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref());
+            async move {
+                let cam = match cam {
+                    Ok(c) => c,
+                    Err(e) => return (name, Err(e)),
+                };
+                tracing::info!("capturing snapshot from '{}'...", name);
+                match cam.snapshot().await {
+                    Ok(snapshot) => {
+                        let ts = snapshot.timestamp.format("%Y%m%d_%H%M%S");
+                        let filename = format!(
+                            "{}_{}.{}",
+                            snapshot.camera_name,
+                            ts,
+                            snapshot.format.extension()
+                        );
+                        let path = dir.join(&filename);
+                        match std::fs::write(&path, &snapshot.data) {
+                            Ok(()) => (name, Ok(path)),
+                            Err(e) => (name, Err(anyhow::anyhow!("write failed: {e}"))),
+                        }
+                    }
+                    Err(e) => (name, Err(e)),
+                }
+            }
+        })
+        .collect();
+
+    let results = futures::future::join_all(futures).await;
+
+    let mut successes: Vec<serde_json::Value> = Vec::new();
+    let mut failures: Vec<serde_json::Value> = Vec::new();
+
+    for (name, result) in &results {
+        match result {
+            Ok(path) => successes.push(serde_json::json!({
+                "camera": name,
+                "path": path.display().to_string(),
+            })),
+            Err(e) => failures.push(serde_json::json!({
+                "camera": name,
+                "error": e.to_string(),
+            })),
+        }
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "successes": successes,
+                "failures": failures,
+            }))?
+        );
+    } else {
+        for entry in &successes {
+            println!(
+                "  {} -> {}",
+                entry["camera"].as_str().unwrap_or(""),
+                entry["path"].as_str().unwrap_or(""),
+            );
+        }
+        for entry in &failures {
+            eprintln!(
+                "  {} FAILED: {}",
+                entry["camera"].as_str().unwrap_or(""),
+                entry["error"].as_str().unwrap_or(""),
+            );
+        }
+        println!();
+        println!(
+            "Summary: {} succeeded, {} failed",
+            successes.len(),
+            failures.len()
+        );
+    }
+
+    if !failures.is_empty() {
+        bail!("{} camera(s) failed to capture a snapshot", failures.len());
+    }
+
+    Ok(())
+}
+
+async fn cmd_stream(
+    config: &config::Config,
+    name: &str,
+    quality: StreamQuality,
+    output: Option<PathBuf>,
+    duration: u64,
+) -> Result<()> {
+    let cam_config = config
+        .find_camera(name)
+        .with_context(|| format!("camera '{}' not found in config", name))?;
+    let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
+    let url = cam.rtsp_url(quality);
+
+    match output {
+        Some(path) => {
+            record_rtsp(&url, &path, duration).await?;
+            println!("Saved stream to {}", path.display());
+        }
+        None => {
+            println!("{}", url);
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_record(
+    config: &config::Config,
+    name: &str,
+    output: Option<PathBuf>,
+    duration: u64,
+) -> Result<()> {
+    let cam_config = config
+        .find_camera(name)
+        .with_context(|| format!("camera '{}' not found in config", name))?;
+    let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
+    let url = cam.rtsp_url(StreamQuality::Main);
+
+    let path = output.unwrap_or_else(|| {
+        let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        PathBuf::from(format!("{}_{}.mp4", name, ts))
+    });
+
+    tracing::info!("recording {}s from '{}'...", duration, name);
+    record_rtsp(&url, &path, duration).await?;
+    println!("Saved recording to {}", path.display());
+    Ok(())
+}
+
+async fn record_rtsp(url: &str, output: &PathBuf, duration: u64) -> Result<()> {
+    let status = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-rtsp_transport",
+            "tcp",
+            "-i",
+            url,
+            "-t",
+            &duration.to_string(),
+            "-c",
+            "copy",
+            "-y",
+        ])
+        .arg(output)
+        .status()
+        .await
+        .context("failed to run ffmpeg — is it installed?")?;
+
+    if !status.success() {
+        bail!("ffmpeg exited with status {}", status);
+    }
+    Ok(())
+}
+
+async fn cmd_events(config: &config::Config, name: &str, watch: bool, json: bool) -> Result<()> {
+    let cam_config = config
+        .find_camera(name)
+        .with_context(|| format!("camera '{}' not found in config", name))?;
+    let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
+
+    if watch {
+        let mut last_detected: Option<bool> = None;
+        loop {
+            match cam.motion_status().await {
+                Ok(status) => {
+                    let changed = last_detected != Some(status.detected);
+                    if changed {
+                        print_motion_status(name, &status, json);
+                        last_detected = Some(status.detected);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error polling {}: {}", name, e);
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        }
+    } else {
+        let status = cam.motion_status().await?;
+        print_motion_status(name, &status, json);
+        Ok(())
+    }
+}
+
+fn print_motion_status(name: &str, status: &MotionStatus, json: bool) {
+    if json {
+        let ts = status.timestamp.map(|t| t.to_rfc3339()).unwrap_or_default();
+        println!(
+            "{}",
+            serde_json::json!({
+                "camera": name,
+                "motion_detected": status.detected,
+                "timestamp": ts,
+            })
+        );
+    } else {
+        let ts = status
+            .timestamp
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let state = if status.detected { "MOTION" } else { "clear" };
+        println!("[{}] {}: {}", ts, name, state);
+    }
+}
+
+async fn cmd_discover(timeout: u64, json: bool) -> Result<()> {
+    use std::time::Duration;
+
+    let cameras = discovery::discover_cameras(Duration::from_secs(timeout)).await?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&cameras)?);
+        return Ok(());
+    }
+
+    if cameras.is_empty() {
+        println!("No cameras found on the network.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<18} {:<20} {:<20} ONVIF URL",
+        "ADDRESS", "MANUFACTURER", "MODEL"
+    );
+    println!("{}", "-".repeat(90));
+
+    for cam in &cameras {
+        println!(
+            "{:<18} {:<20} {:<20} {}",
+            cam.address,
+            cam.manufacturer.as_deref().unwrap_or("-"),
+            cam.model.as_deref().unwrap_or("-"),
+            cam.onvif_url,
+        );
+    }
+
+    println!();
+    println!("Found {} camera(s).", cameras.len());
+    Ok(())
+}
+
+fn cmd_config() -> Result<()> {
+    let path = config::Config::config_path()?;
+    println!("Config path: {}", path.display());
+    if path.exists() {
+        println!("Status: exists");
+    } else {
+        println!("Status: not found");
+        println!();
+        println!("Create it with:");
+        println!();
+        println!("  mkdir -p {}", path.parent().unwrap().display());
+        println!("  cat > {} << 'EOF'", path.display());
+        println!("[[cameras]]");
+        println!("name = \"front-door\"");
+        println!("type = \"reolink\"");
+        println!("host = \"192.168.1.100\"");
+        println!("username = \"admin\"");
+        println!("password = \"your-password\"");
+        println!("EOF");
+    }
+    Ok(())
+}
