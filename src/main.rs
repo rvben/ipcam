@@ -55,12 +55,16 @@ enum Command {
         #[arg(long, conflicts_with_all = ["camera", "output"])]
         all: bool,
 
+        /// Capture snapshots from all cameras and assemble into a single tiled grid image
+        #[arg(long, conflicts_with_all = ["camera", "output"])]
+        grid: bool,
+
         /// Directory to save snapshots when using --all or --every (default: current directory)
         #[arg(long)]
         output_dir: Option<PathBuf>,
 
         /// Capture repeatedly at this interval (e.g. "30s", "5m", "1h"); saves timestamped files
-        #[arg(long, conflicts_with = "all")]
+        #[arg(long, conflicts_with_all = ["all", "grid"])]
         every: Option<String>,
     },
 
@@ -191,6 +195,24 @@ enum Command {
         #[arg(long)]
         auto: bool,
     },
+
+    /// Continuously monitor camera health and print status changes
+    Watch {
+        /// How often to poll cameras (e.g. "30s", "5m", "1h")
+        #[arg(long, default_value = "30s")]
+        interval: String,
+
+        /// Shell command to run on status change; receives CAMERA_NAME, CAMERA_HOST,
+        /// CAMERA_STATUS (online/offline), and CAMERA_DETAIL as environment variables
+        #[arg(long)]
+        exec: Option<String>,
+    },
+
+    /// Test a camera's configuration end-to-end (network, RTSP, snapshot)
+    Test {
+        /// Camera name from config (omit to test all cameras in parallel)
+        camera: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -318,10 +340,13 @@ async fn run() -> Result<()> {
             camera,
             output,
             all,
+            grid,
             output_dir,
             every,
         } => {
-            if all {
+            if grid {
+                cmd_snapshot_grid(&config, output_dir).await
+            } else if all {
                 cmd_snapshot_all(&config, output_dir, cli.json).await
             } else if let Some(interval_str) = every {
                 let name = camera
@@ -374,6 +399,11 @@ async fn run() -> Result<()> {
             preset,
             speed,
         } => cmd_ptz(&config, &camera, action, preset, speed).await,
+        Command::Watch { interval, exec } => {
+            let interval = parse_duration(&interval)?;
+            cmd_watch(&config, interval, exec.as_deref()).await
+        }
+        Command::Test { camera } => cmd_test(&config, camera.as_deref(), cli.json).await,
         Command::Completions { .. } | Command::Init { .. } => {
             unreachable!("handled before config load")
         }
@@ -562,6 +592,209 @@ async fn cmd_snapshot_all(
 
     if !failures.is_empty() {
         bail!("{} camera(s) failed to capture a snapshot", failures.len());
+    }
+
+    Ok(())
+}
+
+async fn cmd_snapshot_grid(
+    config: &config::Config,
+    output_dir: Option<PathBuf>,
+) -> Result<()> {
+    if config.cameras.is_empty() {
+        println!("No cameras configured.");
+        return Ok(());
+    }
+
+    let n = config.cameras.len();
+
+    // Capture all cameras in parallel into a temp directory.
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "camera-cli-grid-{}",
+        chrono::Utc::now().timestamp()
+    ));
+    std::fs::create_dir_all(&tmp_dir)
+        .with_context(|| format!("creating temp directory: {}", tmp_dir.display()))?;
+
+    let futures: Vec<_> = config
+        .cameras
+        .iter()
+        .enumerate()
+        .map(|(idx, cam_config)| {
+            let name = cam_config.name.clone();
+            let tmp_dir = tmp_dir.clone();
+            let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref());
+            async move {
+                let cam = match cam {
+                    Ok(c) => c,
+                    Err(e) => return (idx, name, Err(e)),
+                };
+                tracing::info!("capturing snapshot from '{}'...", name);
+                match cam.snapshot().await {
+                    Ok(snapshot) => {
+                        let path = tmp_dir.join(format!("cam_{:04}.jpg", idx));
+                        match std::fs::write(&path, &snapshot.data) {
+                            Ok(()) => (idx, name, Ok(path)),
+                            Err(e) => (idx, name, Err(anyhow::anyhow!("write failed: {e}"))),
+                        }
+                    }
+                    Err(e) => (idx, name, Err(e)),
+                }
+            }
+        })
+        .collect();
+
+    let results = futures::future::join_all(futures).await;
+
+    // Collect captured frames in camera order; report failures but continue.
+    let mut frame_paths: Vec<Option<PathBuf>> = vec![None; n];
+    let mut failures = 0usize;
+    for (idx, name, result) in results {
+        match result {
+            Ok(path) => frame_paths[idx] = Some(path),
+            Err(e) => {
+                eprintln!("  {} FAILED: {}", name, e);
+                failures += 1;
+            }
+        }
+    }
+
+    let successful: Vec<PathBuf> = frame_paths.into_iter().flatten().collect();
+    if successful.is_empty() {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        bail!("all cameras failed to capture a snapshot");
+    }
+
+    let count = successful.len();
+    let cols = (count as f64).sqrt().ceil() as usize;
+    let rows = count.div_ceil(cols);
+
+    // For an incomplete last row, generate a black placeholder image via ffmpeg.
+    let total_slots = cols * rows;
+    let placeholder = if total_slots > count {
+        // Derive dimensions from the first captured frame via ffprobe, falling back to 1280x720.
+        let placeholder_path = tmp_dir.join("placeholder.jpg");
+        let probe = tokio::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(&successful[0])
+            .output()
+            .await;
+
+        let (w, h) = probe
+            .ok()
+            .and_then(|out| {
+                let s = String::from_utf8_lossy(&out.stdout);
+                let mut parts = s.trim().splitn(2, ',');
+                let w: usize = parts.next()?.parse().ok()?;
+                let h: usize = parts.next()?.parse().ok()?;
+                Some((w, h))
+            })
+            .unwrap_or((1280, 720));
+
+        let status = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-loglevel", "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("color=black:size={w}x{h}:rate=1"),
+                "-frames:v",
+                "1",
+                "-y",
+            ])
+            .arg(&placeholder_path)
+            .status()
+            .await
+            .context("failed to run ffmpeg — is it installed?")?;
+
+        if !status.success() {
+            bail!("ffmpeg failed to create placeholder image");
+        }
+        Some(placeholder_path)
+    } else {
+        None
+    };
+
+    // Build the full slot list, padding with the placeholder where needed.
+    let mut slots: Vec<PathBuf> = successful.clone();
+    for _ in count..total_slots {
+        slots.push(
+            placeholder
+                .clone()
+                .expect("placeholder must exist when slots exceed captures"),
+        );
+    }
+
+    // Build the ffmpeg filter_complex expression.
+    // Single image: no filter needed. 1 row: just hstack. 1 col: just vstack.
+    // General case: hstack each row, then vstack all rows.
+    let filter = if total_slots == 1 {
+        // Single image — just copy it
+        "[0]copy".to_string()
+    } else if rows == 1 {
+        // Single row — just hstack
+        let inputs: String = (0..cols).map(|c| format!("[{}]", c)).collect::<Vec<_>>().join("");
+        format!("{}hstack=inputs={}", inputs, cols)
+    } else if cols == 1 {
+        // Single column — just vstack
+        let inputs: String = (0..rows).map(|r| format!("[{}]", r)).collect::<Vec<_>>().join("");
+        format!("{}vstack=inputs={}", inputs, rows)
+    } else {
+        let mut f = String::new();
+        for r in 0..rows {
+            let row_inputs: String = (0..cols)
+                .map(|c| format!("[{}]", r * cols + c))
+                .collect::<Vec<_>>()
+                .join("");
+            f.push_str(&format!("{}hstack=inputs={}[row{}];", row_inputs, cols, r));
+        }
+        let row_labels: String = (0..rows)
+            .map(|r| format!("[row{}]", r))
+            .collect::<Vec<_>>()
+            .join("");
+        f.push_str(&format!("{}vstack=inputs={}", row_labels, rows));
+        f
+    };
+
+    let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+    let output_path = {
+        let dir = output_dir.unwrap_or_else(|| PathBuf::from("."));
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating output directory: {}", dir.display()))?;
+        dir.join(format!("grid_{}.jpg", ts))
+    };
+
+    let mut cmd = tokio::process::Command::new("ffmpeg");
+    cmd.args(["-loglevel", "error"]);
+    for slot in &slots {
+        cmd.arg("-i").arg(slot);
+    }
+    cmd.args(["-filter_complex", &filter, "-update", "1", "-frames:v", "1", "-y"]);
+    cmd.arg(&output_path);
+
+    let status = cmd
+        .status()
+        .await
+        .context("failed to run ffmpeg — is it installed?")?;
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    if !status.success() {
+        bail!("ffmpeg exited with status {}", status);
+    }
+
+    println!("Saved grid snapshot to {}", output_path.display());
+    if failures > 0 {
+        eprintln!("Warning: {} camera(s) failed to capture", failures);
     }
 
     Ok(())
@@ -1030,6 +1263,143 @@ async fn cmd_status(config: &config::Config, camera: Option<&str>, json: bool) -
     Ok(())
 }
 
+async fn poll_all_cameras(
+    config: &config::Config,
+) -> Vec<(String, String, camera::HealthStatus)> {
+    let futures: Vec<_> = config
+        .cameras
+        .iter()
+        .map(|cam_config| {
+            let name = cam_config.name.clone();
+            let host = cam_config.host.clone();
+            let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref());
+            async move {
+                match cam {
+                    Ok(c) => {
+                        let status = c.is_reachable().await;
+                        (name, host, status)
+                    }
+                    Err(e) => (
+                        name,
+                        host,
+                        camera::HealthStatus {
+                            online: false,
+                            detail: e.to_string(),
+                            latency: std::time::Duration::ZERO,
+                        },
+                    ),
+                }
+            }
+        })
+        .collect();
+
+    futures::future::join_all(futures).await
+}
+
+async fn cmd_watch(
+    config: &config::Config,
+    interval: Duration,
+    exec: Option<&str>,
+) -> Result<()> {
+    if config.cameras.is_empty() {
+        println!("No cameras configured.");
+        return Ok(());
+    }
+
+    // Map from camera name to last known online state.
+    let mut last_state: std::collections::HashMap<String, bool> =
+        std::collections::HashMap::new();
+
+    // Initial poll — print all current states as the startup banner.
+    let now = chrono::Local::now();
+    let ts = now.format("%Y-%m-%d %H:%M:%S");
+    println!(
+        "[{}] Monitoring {} camera{} every {} (Ctrl+C to stop)",
+        ts,
+        config.cameras.len(),
+        if config.cameras.len() == 1 { "" } else { "s" },
+        humantime::format_duration(interval),
+    );
+
+    let initial = poll_all_cameras(config).await;
+    for (name, _host, status) in &initial {
+        let now = chrono::Local::now();
+        let ts = now.format("%Y-%m-%d %H:%M:%S");
+        let state = if status.online { "online" } else { "offline" };
+        println!(
+            "[{}] {}: {} ({}, {}ms)",
+            ts,
+            name,
+            state,
+            status.detail,
+            status.latency.as_millis(),
+        );
+        last_state.insert(name.clone(), status.online);
+    }
+
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Consume the immediate first tick so the next fires after one full interval.
+    ticker.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let results = poll_all_cameras(config).await;
+                for (name, host, status) in &results {
+                    let prev = last_state.get(name.as_str()).copied();
+                    let changed = prev != Some(status.online);
+                    if changed {
+                        let now = chrono::Local::now();
+                        let ts = now.format("%Y-%m-%d %H:%M:%S");
+                        let state = if status.online { "online" } else { "offline" };
+                        let annotation = match prev {
+                            Some(false) => " ← back online",
+                            Some(true)  => " ← went offline",
+                            None        => "",
+                        };
+                        println!(
+                            "[{}] {}: {}{} ({}, {}ms)",
+                            ts,
+                            name,
+                            state,
+                            annotation,
+                            status.detail,
+                            status.latency.as_millis(),
+                        );
+                        last_state.insert(name.clone(), status.online);
+
+                        if let Some(cmd) = exec {
+                            let status_str = if status.online { "online" } else { "offline" };
+                            let run_result = tokio::process::Command::new("sh")
+                                .arg("-c")
+                                .arg(cmd)
+                                .env("CAMERA_NAME", name)
+                                .env("CAMERA_HOST", host)
+                                .env("CAMERA_STATUS", status_str)
+                                .env("CAMERA_DETAIL", &status.detail)
+                                .status()
+                                .await;
+                            if let Err(e) = run_result {
+                                eprintln!(
+                                    "Warning: --exec command failed for '{}': {}",
+                                    name, e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                println!("\nStopped monitoring.");
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn cmd_frigate(config: &config::Config, action: FrigateAction, json: bool) -> Result<()> {
     let frigate_config = config
         .frigate
@@ -1111,5 +1481,209 @@ fn cmd_config() -> Result<()> {
         println!("password = \"your-password\"");
         println!("EOF");
     }
+    Ok(())
+}
+
+/// Result of a single test step.
+struct StepResult {
+    passed: bool,
+    elapsed: Duration,
+    /// Failure message; empty when passed.
+    message: String,
+}
+
+/// Run all three test steps for one camera and return per-step results.
+async fn test_camera(cam_config: &config::CameraConfig, go2rtc: Option<&config::Go2rtcConfig>) -> [StepResult; 3] {
+    // --- Step 1: TCP reachability ---
+    let reachable = {
+        let start = std::time::Instant::now();
+        let addr = format!("{}:{}", cam_config.host, cam_config.rtsp_port);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await;
+        let elapsed = start.elapsed();
+        match outcome {
+            Ok(Ok(_)) => StepResult { passed: true, elapsed, message: String::new() },
+            Ok(Err(e)) => StepResult { passed: false, elapsed, message: e.to_string() },
+            Err(_) => StepResult {
+                passed: false,
+                elapsed,
+                message: "connection timed out".to_string(),
+            },
+        }
+    };
+
+    // --- Step 2: RTSP stream probe via ffprobe ---
+    let rtsp = if !reachable.passed {
+        StepResult { passed: false, elapsed: Duration::ZERO, message: "skipped".to_string() }
+    } else {
+        let start = std::time::Instant::now();
+        let cam = vendors::create_camera(cam_config, go2rtc);
+        match cam {
+            Err(e) => StepResult { passed: false, elapsed: start.elapsed(), message: e.to_string() },
+            Ok(c) => {
+                let url = c.rtsp_url(StreamQuality::Main);
+                let probe = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    tokio::process::Command::new("ffprobe")
+                        .args([
+                            "-v", "quiet",
+                            "-rtsp_transport", "tcp",
+                            "-i", &url,
+                        ])
+                        .output(),
+                )
+                .await;
+                let elapsed = start.elapsed();
+                match probe {
+                    Ok(Ok(out)) if out.status.success() => {
+                        StepResult { passed: true, elapsed, message: String::new() }
+                    }
+                    Ok(Ok(out)) => {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        let detail = stderr.lines().next().unwrap_or("ffprobe failed").trim().to_string();
+                        StepResult { passed: false, elapsed, message: detail }
+                    }
+                    Ok(Err(e)) => StepResult {
+                        passed: false,
+                        elapsed,
+                        message: format!("ffprobe error: {e}"),
+                    },
+                    Err(_) => StepResult {
+                        passed: false,
+                        elapsed,
+                        message: "timed out after 5s".to_string(),
+                    },
+                }
+            }
+        }
+    };
+
+    // --- Step 3: Snapshot ---
+    let snapshot = if !reachable.passed {
+        StepResult { passed: false, elapsed: Duration::ZERO, message: "skipped".to_string() }
+    } else {
+        let start = std::time::Instant::now();
+        let cam = vendors::create_camera(cam_config, go2rtc);
+        match cam {
+            Err(e) => StepResult { passed: false, elapsed: start.elapsed(), message: e.to_string() },
+            Ok(c) => {
+                let result = tokio::time::timeout(Duration::from_secs(15), c.snapshot()).await;
+                let elapsed = start.elapsed();
+                match result {
+                    Ok(Ok(_)) => StepResult { passed: true, elapsed, message: String::new() },
+                    Ok(Err(e)) => StepResult { passed: false, elapsed, message: e.to_string() },
+                    Err(_) => StepResult {
+                        passed: false,
+                        elapsed,
+                        message: "timed out after 15s".to_string(),
+                    },
+                }
+            }
+        }
+    };
+
+    [reachable, rtsp, snapshot]
+}
+
+/// Format elapsed duration for display: sub-second as ms, otherwise as fractional seconds.
+fn fmt_elapsed(d: Duration) -> String {
+    let ms = d.as_millis();
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else {
+        format!("{:.1}s", d.as_secs_f64())
+    }
+}
+
+async fn cmd_test(config: &config::Config, camera: Option<&str>, json: bool) -> Result<()> {
+    let cameras_to_test: Vec<&config::CameraConfig> = match camera {
+        Some(name) => {
+            let cam = config
+                .find_camera(name)
+                .with_context(|| format!("camera '{}' not found in config", name))?;
+            vec![cam]
+        }
+        None => config.cameras.iter().collect(),
+    };
+
+    if cameras_to_test.is_empty() {
+        if json {
+            println!("[]");
+        } else {
+            println!("No cameras configured.");
+        }
+        return Ok(());
+    }
+
+    let go2rtc = config.go2rtc.clone();
+
+    let futures: Vec<_> = cameras_to_test
+        .iter()
+        .map(|cam_config| {
+            let name = cam_config.name.clone();
+            let cam_type = cam_config.camera_type.to_string();
+            let host = cam_config.host.clone();
+            let go2rtc_ref = go2rtc.as_ref();
+            let cam_config = *cam_config;
+            async move {
+                let results = test_camera(cam_config, go2rtc_ref).await;
+                (name, cam_type, host, results)
+            }
+        })
+        .collect();
+
+    let all_results = futures::future::join_all(futures).await;
+
+    if json {
+        let entries: Vec<serde_json::Value> = all_results
+            .iter()
+            .map(|(name, cam_type, host, steps)| {
+                let [ref reachable, ref rtsp, ref snapshot] = *steps;
+                serde_json::json!({
+                    "camera": name,
+                    "type": cam_type,
+                    "host": host,
+                    "steps": {
+                        "reachable": {
+                            "passed": reachable.passed,
+                            "elapsed_ms": reachable.elapsed.as_millis(),
+                            "message": reachable.message,
+                        },
+                        "rtsp_stream": {
+                            "passed": rtsp.passed,
+                            "elapsed_ms": rtsp.elapsed.as_millis(),
+                            "message": rtsp.message,
+                        },
+                        "snapshot": {
+                            "passed": snapshot.passed,
+                            "elapsed_ms": snapshot.elapsed.as_millis(),
+                            "message": snapshot.message,
+                        },
+                    }
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+    } else {
+        for (name, cam_type, host, steps) in &all_results {
+            println!("Testing {name} ({cam_type} @ {host})...");
+            let labels = ["reachable", "RTSP stream", "snapshot"];
+            let [ref reachable, ref rtsp, ref snapshot] = *steps;
+            for (label, step) in labels.iter().zip([reachable, rtsp, snapshot]) {
+                let icon = if step.passed { "✓" } else { "✗" };
+                let timing = fmt_elapsed(step.elapsed);
+                if step.message.is_empty() {
+                    println!("  {icon} {label:<18} ({timing})");
+                } else {
+                    println!("  {icon} {label:<18} ({timing}) — {}", step.message);
+                }
+            }
+            println!();
+        }
+    }
+
     Ok(())
 }
