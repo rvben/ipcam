@@ -1,12 +1,13 @@
 mod camera;
 mod config;
 mod discovery;
+mod frigate;
 mod vendors;
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use camera::{MotionStatus, StreamQuality};
+use camera::{MotionStatus, PtzDirection, StreamQuality};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -111,6 +112,68 @@ enum Command {
         #[arg(short, long)]
         watch: bool,
     },
+
+    /// Check which cameras are online
+    Status {
+        /// Camera name (omit to check all cameras)
+        camera: Option<String>,
+    },
+
+    /// Interact with Frigate NVR
+    Frigate {
+        #[command(subcommand)]
+        action: FrigateAction,
+    },
+
+    /// Control pan/tilt/zoom on a camera
+    Ptz {
+        /// Camera name from config
+        camera: String,
+
+        /// PTZ action: left, right, up, down, stop, preset
+        action: PtzAction,
+
+        /// Preset number (required for "preset" action)
+        preset: Option<u32>,
+
+        /// Movement speed (1-9, default 5)
+        #[arg(short, long, default_value = "5", value_parser = clap::value_parser!(u8).range(1..=9))]
+        speed: u8,
+    },
+}
+
+#[derive(Debug, Clone, clap::ValueEnum)]
+enum PtzAction {
+    Left,
+    Right,
+    Up,
+    Down,
+    Stop,
+    Preset,
+}
+
+#[derive(Subcommand)]
+enum FrigateAction {
+    /// List recent events from Frigate
+    Events {
+        /// Filter by camera name
+        #[arg(short, long)]
+        camera: Option<String>,
+
+        /// Maximum number of events to return
+        #[arg(short, long, default_value = "10")]
+        limit: u32,
+    },
+
+    /// Save the latest snapshot from a Frigate camera
+    Snapshot {
+        /// Camera name (uses Frigate naming, e.g. front_door)
+        camera: String,
+
+        /// Output file path
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -211,6 +274,14 @@ async fn run() -> Result<()> {
         Command::Config => cmd_config(),
         Command::Discover { timeout } => cmd_discover(timeout, cli.json).await,
         Command::Events { camera, watch } => cmd_events(&config, &camera, watch, cli.json).await,
+        Command::Status { camera } => cmd_status(&config, camera.as_deref(), cli.json).await,
+        Command::Frigate { action } => cmd_frigate(&config, action, cli.json).await,
+        Command::Ptz {
+            camera,
+            action,
+            preset,
+            speed,
+        } => cmd_ptz(&config, &camera, action, preset, speed).await,
     }
 }
 
@@ -557,6 +628,189 @@ async fn cmd_discover(timeout: u64, json: bool) -> Result<()> {
 
     println!();
     println!("Found {} camera(s).", cameras.len());
+    Ok(())
+}
+
+async fn cmd_ptz(
+    config: &config::Config,
+    name: &str,
+    action: PtzAction,
+    preset: Option<u32>,
+    speed: u8,
+) -> Result<()> {
+    let cam_config = config
+        .find_camera(name)
+        .with_context(|| format!("camera '{}' not found in config", name))?;
+    let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
+
+    // Normalize speed from 1-9 range to 0.0-1.0
+    let normalized_speed = speed as f32 / 9.0;
+
+    match action {
+        PtzAction::Left => {
+            cam.ptz_move(PtzDirection::Left, normalized_speed).await?;
+            println!("Moving '{}' left (speed {})", name, speed);
+        }
+        PtzAction::Right => {
+            cam.ptz_move(PtzDirection::Right, normalized_speed).await?;
+            println!("Moving '{}' right (speed {})", name, speed);
+        }
+        PtzAction::Up => {
+            cam.ptz_move(PtzDirection::Up, normalized_speed).await?;
+            println!("Moving '{}' up (speed {})", name, speed);
+        }
+        PtzAction::Down => {
+            cam.ptz_move(PtzDirection::Down, normalized_speed).await?;
+            println!("Moving '{}' down (speed {})", name, speed);
+        }
+        PtzAction::Stop => {
+            cam.ptz_stop().await?;
+            println!("Stopped PTZ movement on '{}'", name);
+        }
+        PtzAction::Preset => {
+            let num = preset
+                .ok_or_else(|| anyhow::anyhow!("preset number is required for 'preset' action"))?;
+            cam.ptz_goto_preset(num).await?;
+            println!("Moving '{}' to preset {}", name, num);
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_status(config: &config::Config, camera: Option<&str>, json: bool) -> Result<()> {
+    let cameras_to_check: Vec<&config::CameraConfig> = match camera {
+        Some(name) => {
+            let cam = config
+                .find_camera(name)
+                .with_context(|| format!("camera '{}' not found in config", name))?;
+            vec![cam]
+        }
+        None => config.cameras.iter().collect(),
+    };
+
+    if cameras_to_check.is_empty() {
+        if json {
+            println!("[]");
+        } else {
+            println!("No cameras configured.");
+        }
+        return Ok(());
+    }
+
+    let futures: Vec<_> = cameras_to_check
+        .iter()
+        .map(|cam_config| {
+            let name = cam_config.name.clone();
+            let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref());
+            async move {
+                match cam {
+                    Ok(c) => {
+                        let status = c.is_reachable().await;
+                        (name, status)
+                    }
+                    Err(e) => (
+                        name,
+                        camera::HealthStatus {
+                            online: false,
+                            detail: e.to_string(),
+                            latency: std::time::Duration::ZERO,
+                        },
+                    ),
+                }
+            }
+        })
+        .collect();
+
+    let results = futures::future::join_all(futures).await;
+
+    if json {
+        let entries: Vec<_> = results
+            .iter()
+            .map(|(name, status)| {
+                serde_json::json!({
+                    "camera": name,
+                    "online": status.online,
+                    "detail": status.detail,
+                    "latency_ms": status.latency.as_millis(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+    } else {
+        for (name, status) in &results {
+            let state = if status.online { "online" } else { "offline" };
+            println!(
+                "{:<20} {:<8} ({}, {}ms)",
+                name,
+                state,
+                status.detail,
+                status.latency.as_millis(),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_frigate(config: &config::Config, action: FrigateAction, json: bool) -> Result<()> {
+    let frigate_config = config
+        .frigate
+        .as_ref()
+        .context("no [frigate] section in config file")?;
+    let client = frigate::FrigateClient::new(frigate_config);
+
+    match action {
+        FrigateAction::Events { camera, limit } => {
+            // If user passes a camera-cli name, resolve its frigate_name
+            let frigate_camera = camera.as_ref().map(|name| {
+                config
+                    .find_camera(name)
+                    .map(|c| c.frigate_name())
+                    .unwrap_or_else(|| name.clone())
+            });
+
+            let events = client.events(frigate_camera.as_deref(), limit).await?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&events)?);
+            } else {
+                if events.is_empty() {
+                    println!("No events found.");
+                    return Ok(());
+                }
+                println!(
+                    "{:<24} {:<18} {:<12} {:<8}",
+                    "TIME", "CAMERA", "LABEL", "SCORE"
+                );
+                println!("{}", "-".repeat(64));
+                for event in &events {
+                    let ts = chrono::DateTime::from_timestamp(event.start_time as i64, 0)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_else(|| format!("{:.0}", event.start_time));
+                    let score = event
+                        .score
+                        .map(|s| format!("{:.0}%", s * 100.0))
+                        .unwrap_or_else(|| "-".to_string());
+                    println!(
+                        "{:<24} {:<18} {:<12} {:<8}",
+                        ts, event.camera, event.label, score,
+                    );
+                }
+            }
+        }
+        FrigateAction::Snapshot { camera, output } => {
+            // If user passes a camera-cli name, resolve its frigate_name
+            let frigate_camera = config
+                .find_camera(&camera)
+                .map(|c| c.frigate_name())
+                .unwrap_or_else(|| camera.clone());
+
+            let path = client.snapshot(&frigate_camera, output).await?;
+            println!("Saved Frigate snapshot to {}", path.display());
+        }
+    }
+
     Ok(())
 }
 

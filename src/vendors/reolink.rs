@@ -1,7 +1,12 @@
+use std::time::Instant;
+
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 
-use crate::camera::{Camera, CameraInfo, ImageFormat, MotionStatus, Snapshot, StreamQuality};
+use crate::camera::{
+    Camera, CameraInfo, HealthStatus, ImageFormat, MotionStatus, PtzDirection, Snapshot,
+    StreamQuality,
+};
 use crate::config::CameraConfig;
 
 pub struct ReolinkCamera {
@@ -117,5 +122,117 @@ impl Camera for ReolinkCamera {
             detected: state != 0,
             timestamp: Some(chrono::Utc::now()),
         })
+    }
+
+    async fn is_reachable(&self) -> HealthStatus {
+        let start = Instant::now();
+        let url = self.api_url("GetDevInfo");
+        let body = serde_json::json!([{
+            "cmd": "GetDevInfo",
+            "action": 0,
+            "param": {}
+        }]);
+
+        match self
+            .client
+            .post(&url)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(3))
+            .send()
+            .await
+        {
+            Ok(resp) => match resp.json::<serde_json::Value>().await {
+                Ok(data) => {
+                    let latency = start.elapsed();
+                    let model = data[0]["value"]["DevInfo"]["model"]
+                        .as_str()
+                        .unwrap_or("unknown model");
+                    HealthStatus {
+                        online: true,
+                        detail: model.to_string(),
+                        latency,
+                    }
+                }
+                Err(e) => HealthStatus {
+                    online: false,
+                    detail: e.to_string(),
+                    latency: start.elapsed(),
+                },
+            },
+            Err(e) => {
+                let detail = if e.is_timeout() {
+                    "connection timed out".to_string()
+                } else if e.is_connect() {
+                    "connection refused".to_string()
+                } else {
+                    e.to_string()
+                };
+                HealthStatus {
+                    online: false,
+                    detail,
+                    latency: start.elapsed(),
+                }
+            }
+        }
+    }
+
+    async fn ptz_move(&self, direction: PtzDirection, speed: f32) -> Result<()> {
+        let (pan, tilt) = direction.velocity(speed);
+        let url = self.api_url("PtzCtrl");
+        let body = serde_json::json!([{
+            "cmd": "PtzCtrl",
+            "action": 0,
+            "param": {
+                "channel": 0,
+                "op": "Start",
+                "speed": {
+                    "pan": pan,
+                    "tilt": tilt,
+                }
+            }
+        }]);
+        let resp = self.client.post(&url).json(&body).send().await?;
+        let data: serde_json::Value = resp.json().await?;
+        if data[0]["code"].as_i64() != Some(0) {
+            bail!("PTZ move failed: {}", data);
+        }
+        Ok(())
+    }
+
+    async fn ptz_stop(&self) -> Result<()> {
+        let url = self.api_url("PtzCtrl");
+        let body = serde_json::json!([{
+            "cmd": "PtzCtrl",
+            "action": 0,
+            "param": {
+                "channel": 0,
+                "op": "Stop",
+            }
+        }]);
+        let resp = self.client.post(&url).json(&body).send().await?;
+        let data: serde_json::Value = resp.json().await?;
+        if data[0]["code"].as_i64() != Some(0) {
+            bail!("PTZ stop failed: {}", data);
+        }
+        Ok(())
+    }
+
+    async fn ptz_goto_preset(&self, preset: u32) -> Result<()> {
+        let url = self.api_url("PtzCtrl");
+        let body = serde_json::json!([{
+            "cmd": "PtzCtrl",
+            "action": 0,
+            "param": {
+                "channel": 0,
+                "op": "ToPos",
+                "id": preset,
+            }
+        }]);
+        let resp = self.client.post(&url).json(&body).send().await?;
+        let data: serde_json::Value = resp.json().await?;
+        if data[0]["code"].as_i64() != Some(0) {
+            bail!("PTZ goto preset failed: {}", data);
+        }
+        Ok(())
     }
 }
