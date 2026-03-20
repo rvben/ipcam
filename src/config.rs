@@ -128,4 +128,41 @@ impl Config {
     pub fn find_camera(&self, name: &str) -> Option<&CameraConfig> {
         self.cameras.iter().find(|c| c.name == name)
     }
+
+    pub fn migrate_if_needed() -> Result<bool> {
+        let new_path = Self::config_path()?;
+        if new_path.exists() {
+            return Ok(false);
+        }
+
+        let config_dir = dirs::config_dir().context("could not determine config directory")?;
+        let candidates = [
+            config_dir.join("camctl").join("config.toml"),
+            config_dir.join("camera-cli").join("config.toml"),
+        ];
+
+        for old_path in &candidates {
+            if old_path.exists() {
+                if let Some(parent) = new_path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("creating directory {}", parent.display()))?;
+                }
+                std::fs::copy(old_path, &new_path).with_context(|| {
+                    format!(
+                        "copying {} to {}",
+                        old_path.display(),
+                        new_path.display()
+                    )
+                })?;
+                println!(
+                    "Migrated config from {} to {}",
+                    old_path.display(),
+                    new_path.display()
+                );
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
 }
