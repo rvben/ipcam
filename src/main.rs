@@ -2,13 +2,15 @@ mod camera;
 mod config;
 mod discovery;
 mod frigate;
+mod init;
 mod vendors;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use camera::{MotionStatus, PtzDirection, StreamQuality};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "camera-cli", about = "Manage IP cameras from the command line")]
@@ -49,9 +51,13 @@ enum Command {
         #[arg(long, conflicts_with_all = ["camera", "output"])]
         all: bool,
 
-        /// Directory to save snapshots when using --all (default: current directory)
+        /// Directory to save snapshots when using --all or --every (default: current directory)
         #[arg(long)]
         output_dir: Option<PathBuf>,
+
+        /// Capture repeatedly at this interval (e.g. "30s", "5m", "1h"); saves timestamped files
+        #[arg(long, conflicts_with = "all")]
+        every: Option<String>,
     },
 
     /// Capture snapshots from all configured cameras in parallel
@@ -91,6 +97,28 @@ enum Command {
         /// Duration in seconds
         #[arg(short, long, default_value = "30")]
         duration: u64,
+    },
+
+    /// Capture a timelapse from a camera
+    Timelapse {
+        /// Camera name from config
+        camera: String,
+
+        /// Interval between snapshots (e.g. "30s", "5m")
+        #[arg(long, default_value = "30s")]
+        interval: String,
+
+        /// Total duration of the capture session (e.g. "1h", "30m")
+        #[arg(long, default_value = "1h")]
+        duration: String,
+
+        /// Output MP4 file path
+        #[arg(short, long, default_value = "timelapse.mp4")]
+        output: PathBuf,
+
+        /// Also keep individual frames in this directory
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
     },
 
     /// Show the config file path and status
@@ -139,6 +167,25 @@ enum Command {
         /// Movement speed (1-9, default 5)
         #[arg(short, long, default_value = "5", value_parser = clap::value_parser!(u8).range(1..=9))]
         speed: u8,
+    },
+
+    /// Generate shell completion scripts
+    ///
+    /// Print a completion script to stdout and install it for your shell:
+    ///
+    ///   camera-cli completions zsh  > ~/.zfunc/_camera-cli
+    ///   camera-cli completions bash > /etc/bash_completion.d/camera-cli
+    ///   camera-cli completions fish > ~/.config/fish/completions/camera-cli.fish
+    Completions {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
+    },
+
+    /// Interactively set up the config file from discovered cameras
+    Init {
+        /// Non-interactive: auto-generate config from discovered cameras using defaults
+        #[arg(long)]
+        auto: bool,
     },
 }
 
@@ -233,8 +280,31 @@ fn print_error(err: &anyhow::Error) {
     }
 }
 
+/// Parse a human-readable duration string like "30s", "5m", "1h", "2h30m".
+fn parse_duration(s: &str) -> Result<Duration> {
+    humantime::parse_duration(s).with_context(|| {
+        format!(
+            "invalid duration '{}' — use formats like '30s', '5m', '1h', '2h30m'",
+            s
+        )
+    })
+}
+
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+
+    if let Command::Completions { shell } = cli.command {
+        let mut cmd = Cli::command();
+        let bin_name = cmd.get_name().to_string();
+        clap_complete::generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
+        return Ok(());
+    }
+
+    // `init` does not require an existing config file.
+    if let Command::Init { auto } = cli.command {
+        return init::run_init(auto).await;
+    }
+
     let config = config::Config::load()?;
 
     match cli.command {
@@ -245,9 +315,16 @@ async fn run() -> Result<()> {
             output,
             all,
             output_dir,
+            every,
         } => {
             if all {
                 cmd_snapshot_all(&config, output_dir, cli.json).await
+            } else if let Some(interval_str) = every {
+                let name = camera
+                    .ok_or_else(|| anyhow::anyhow!("camera name is required when using --every"))?;
+                let dir = output_dir.unwrap_or_else(|| PathBuf::from("."));
+                let interval = parse_duration(&interval_str)?;
+                cmd_snapshot_watch(&config, &name, dir, interval).await
             } else {
                 let name = camera.ok_or_else(|| {
                     anyhow::anyhow!(
@@ -271,6 +348,17 @@ async fn run() -> Result<()> {
             output,
             duration,
         } => cmd_record(&config, &camera, output, duration).await,
+        Command::Timelapse {
+            camera,
+            interval,
+            duration,
+            output,
+            output_dir,
+        } => {
+            let interval = parse_duration(&interval)?;
+            let duration = parse_duration(&duration)?;
+            cmd_timelapse(&config, &camera, interval, duration, output, output_dir).await
+        }
         Command::Config => cmd_config(),
         Command::Discover { timeout } => cmd_discover(timeout, cli.json).await,
         Command::Events { camera, watch } => cmd_events(&config, &camera, watch, cli.json).await,
@@ -282,6 +370,9 @@ async fn run() -> Result<()> {
             preset,
             speed,
         } => cmd_ptz(&config, &camera, action, preset, speed).await,
+        Command::Completions { .. } | Command::Init { .. } => {
+            unreachable!("handled before config load")
+        }
     }
 }
 
@@ -472,6 +563,158 @@ async fn cmd_snapshot_all(
     Ok(())
 }
 
+async fn cmd_snapshot_watch(
+    config: &config::Config,
+    name: &str,
+    output_dir: PathBuf,
+    interval: Duration,
+) -> Result<()> {
+    let cam_config = config
+        .find_camera(name)
+        .with_context(|| format!("camera '{}' not found in config", name))?;
+    let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
+
+    std::fs::create_dir_all(&output_dir)
+        .with_context(|| format!("creating output directory: {}", output_dir.display()))?;
+
+    println!(
+        "Capturing snapshot from '{}' every {}s into {}",
+        name,
+        interval.as_secs(),
+        output_dir.display()
+    );
+    println!("Press Ctrl+C to stop.");
+
+    loop {
+        match cam.snapshot().await {
+            Ok(snapshot) => {
+                let ts = snapshot.timestamp.format("%Y%m%d_%H%M%S");
+                let filename = format!(
+                    "{}_{}.{}",
+                    snapshot.camera_name,
+                    ts,
+                    snapshot.format.extension()
+                );
+                let path = output_dir.join(&filename);
+                std::fs::write(&path, &snapshot.data)?;
+                println!("  {}", path.display());
+            }
+            Err(e) => {
+                eprintln!("  snapshot failed: {}", e);
+            }
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+async fn cmd_timelapse(
+    config: &config::Config,
+    name: &str,
+    interval: Duration,
+    duration: Duration,
+    output: PathBuf,
+    output_dir: Option<PathBuf>,
+) -> Result<()> {
+    let cam_config = config
+        .find_camera(name)
+        .with_context(|| format!("camera '{}' not found in config", name))?;
+    let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
+
+    let frames_dir = output_dir
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("camera-cli-timelapse-{}", name)));
+    std::fs::create_dir_all(&frames_dir)
+        .with_context(|| format!("creating frames directory: {}", frames_dir.display()))?;
+
+    let total_frames = (duration.as_secs_f64() / interval.as_secs_f64()).ceil() as u64;
+    println!(
+        "Capturing timelapse from '{}': ~{} frames over {}s (every {}s)",
+        name,
+        total_frames,
+        duration.as_secs(),
+        interval.as_secs()
+    );
+
+    let start = std::time::Instant::now();
+    let mut frame_count: u64 = 0;
+
+    while start.elapsed() < duration {
+        match cam.snapshot().await {
+            Ok(snapshot) => {
+                let filename = format!("frame_{:06}.{}", frame_count, snapshot.format.extension());
+                let path = frames_dir.join(&filename);
+                std::fs::write(&path, &snapshot.data)?;
+                frame_count += 1;
+                println!("  [{}/~{}] {}", frame_count, total_frames, path.display());
+            }
+            Err(e) => {
+                eprintln!("  frame {} failed: {}", frame_count, e);
+            }
+        }
+
+        if start.elapsed() + interval > duration {
+            break;
+        }
+        tokio::time::sleep(interval).await;
+    }
+
+    if frame_count == 0 {
+        bail!("no frames captured — cannot create timelapse");
+    }
+
+    println!(
+        "Assembling {} frames into {}...",
+        frame_count,
+        output.display()
+    );
+
+    let ext = frames_dir
+        .read_dir()?
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_name().to_string_lossy().starts_with("frame_"))
+        .map(|e| {
+            e.path()
+                .extension()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string()
+        })
+        .unwrap_or_else(|| "jpg".to_string());
+
+    let pattern = frames_dir.join(format!("frame_%06d.{}", ext));
+    let fps = "24";
+
+    let status = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-framerate",
+            fps,
+            "-i",
+            &pattern.to_string_lossy(),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-y",
+        ])
+        .arg(&output)
+        .status()
+        .await
+        .context("failed to run ffmpeg — is it installed?")?;
+
+    if !status.success() {
+        bail!("ffmpeg exited with status {}", status);
+    }
+
+    println!("Timelapse saved to {}", output.display());
+
+    // Clean up temp frames if we created the directory
+    if output_dir.is_none() {
+        std::fs::remove_dir_all(&frames_dir).ok();
+    }
+
+    Ok(())
+}
+
 async fn cmd_stream(
     config: &config::Config,
     name: &str,
@@ -596,8 +839,6 @@ fn print_motion_status(name: &str, status: &MotionStatus, json: bool) {
 }
 
 async fn cmd_discover(timeout: u64, json: bool) -> Result<()> {
-    use std::time::Duration;
-
     let cameras = discovery::discover_cameras(Duration::from_secs(timeout)).await?;
 
     if json {

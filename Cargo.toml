@@ -10,6 +10,7 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 dirs = "6"
 quick-xml = "0.37"
 reqwest = { version = "0.12", features = ["json"] }
@@ -22,6 +23,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = { version = "2", features = ["serde"] }
 base64 = "0.22"
 futures = "0.3.32"
+humantime = "2"
 rand = "0.9"
 sha1 = "0.10"
 
