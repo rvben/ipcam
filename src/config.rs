@@ -8,6 +8,8 @@ pub struct Config {
     #[serde(default)]
     pub go2rtc: Option<Go2rtcConfig>,
     #[serde(default)]
+    pub frigate: Option<FrigateConfig>,
+    #[serde(default)]
     pub cameras: Vec<CameraConfig>,
 }
 
@@ -29,6 +31,23 @@ fn default_go2rtc_port() -> u16 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrigateConfig {
+    pub host: String,
+    #[serde(default = "default_frigate_port")]
+    pub port: u16,
+}
+
+impl FrigateConfig {
+    pub fn base_url(&self) -> String {
+        format!("http://{}:{}", self.host, self.port)
+    }
+}
+
+fn default_frigate_port() -> u16 {
+    5001
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CameraConfig {
     pub name: String,
     #[serde(rename = "type")]
@@ -40,6 +59,10 @@ pub struct CameraConfig {
     pub password: Option<String>,
     /// go2rtc stream name for cameras behind a restream proxy
     pub go2rtc_stream: Option<String>,
+    /// ONVIF port override (default: 2020 for Tapo, 8000 for Reolink)
+    pub onvif_port: Option<u16>,
+    /// Frigate camera name (Frigate uses underscores, e.g. "front_door")
+    pub frigate_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,6 +81,24 @@ impl std::fmt::Display for CameraType {
     }
 }
 
+impl CameraConfig {
+    /// Returns the ONVIF port, using the explicit override or a per-vendor default.
+    pub fn onvif_port(&self) -> u16 {
+        self.onvif_port.unwrap_or(match self.camera_type {
+            CameraType::Tapo => 2020,
+            CameraType::Reolink => 8000,
+        })
+    }
+
+    /// Returns the Frigate camera name, falling back to the config name with
+    /// hyphens replaced by underscores.
+    pub fn frigate_name(&self) -> String {
+        self.frigate_name
+            .clone()
+            .unwrap_or_else(|| self.name.replace('-', "_"))
+    }
+}
+
 fn default_rtsp_port() -> u16 {
     554
 }
@@ -68,6 +109,7 @@ impl Config {
         if !path.exists() {
             return Ok(Self {
                 go2rtc: None,
+                frigate: None,
                 cameras: Vec::new(),
             });
         }
