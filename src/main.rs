@@ -133,8 +133,11 @@ enum Command {
         output_dir: Option<PathBuf>,
     },
 
-    /// Show the config file path and status
-    Config,
+    /// Manage the config file
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
+    },
 
     /// Discover cameras on the local network via ONVIF WS-Discovery
     Discover {
@@ -217,6 +220,14 @@ enum Command {
         /// Camera name from config (omit to test all cameras in parallel)
         camera: Option<String>,
     },
+
+    /// Rename a camera in the config file
+    Rename {
+        /// Current camera name
+        old_name: String,
+        /// New camera name
+        new_name: String,
+    },
 }
 
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -251,6 +262,18 @@ enum FrigateAction {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Print the config file path and status (default)
+    Path,
+
+    /// Open the config file in $EDITOR (or $VISUAL, fallback to vim)
+    Edit,
+
+    /// Print the current config with passwords masked
+    Show,
 }
 
 #[tokio::main]
@@ -393,7 +416,11 @@ async fn run() -> Result<()> {
             let duration = parse_duration(&duration)?;
             cmd_timelapse(&config, &camera, interval, duration, output, output_dir).await
         }
-        Command::Config => cmd_config(),
+        Command::Config { action } => match action.unwrap_or(ConfigAction::Path) {
+            ConfigAction::Path => cmd_config_path(),
+            ConfigAction::Edit => cmd_config_edit(),
+            ConfigAction::Show => cmd_config_show(),
+        },
         Command::Discover { timeout } => cmd_discover(timeout, cli.json).await,
         Command::Events { camera, watch } => cmd_events(&config, &camera, watch, cli.json).await,
         Command::Status { camera } => cmd_status(&config, camera.as_deref(), cli.json).await,
@@ -409,6 +436,7 @@ async fn run() -> Result<()> {
             cmd_watch(&config, interval, exec.as_deref()).await
         }
         Command::Test { camera } => cmd_test(&config, camera.as_deref(), cli.json).await,
+        Command::Rename { old_name, new_name } => cmd_rename(&old_name, &new_name),
         Command::Completions { .. } | Command::Init { .. } => {
             unreachable!("handled before config load")
         }
@@ -1535,7 +1563,7 @@ async fn cmd_frigate(config: &config::Config, action: FrigateAction, json: bool)
     Ok(())
 }
 
-fn cmd_config() -> Result<()> {
+fn cmd_config_path() -> Result<()> {
     let path = config::Config::config_path()?;
     println!("Config path: {}", path.display());
     if path.exists() {
@@ -1555,6 +1583,46 @@ fn cmd_config() -> Result<()> {
         println!("password = \"your-password\"");
         println!("EOF");
     }
+    Ok(())
+}
+
+fn cmd_config_edit() -> Result<()> {
+    let path = config::Config::config_path()?;
+
+    // Ensure the config directory exists before opening the editor.
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating config directory {}", parent.display()))?;
+    }
+
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vim".to_string());
+
+    let status = std::process::Command::new(&editor)
+        .arg(&path)
+        .status()
+        .with_context(|| format!("launching editor '{editor}'"))?;
+
+    if !status.success() {
+        anyhow::bail!("editor '{editor}' exited with status {status}");
+    }
+    Ok(())
+}
+
+fn cmd_config_show() -> Result<()> {
+    let mut cfg = config::Config::load()?;
+
+    // Mask passwords in all camera entries.
+    for cam in &mut cfg.cameras {
+        if cam.password.is_some() {
+            cam.password = Some("****".to_string());
+        }
+    }
+
+    let toml = toml::to_string_pretty(&cfg)
+        .context("serializing config to TOML")?;
+    print!("{toml}");
     Ok(())
 }
 
@@ -1757,6 +1825,60 @@ async fn cmd_test(config: &config::Config, camera: Option<&str>, json: bool) -> 
             }
             println!();
         }
+    }
+
+    Ok(())
+}
+
+fn cmd_rename(old_name: &str, new_name: &str) -> Result<()> {
+    let mut config = config::Config::load()?;
+
+    // Verify old_name exists.
+    let pos = config
+        .cameras
+        .iter()
+        .position(|c| c.name == old_name)
+        .with_context(|| format!("camera '{}' not found in config", old_name))?;
+
+    // Verify new_name is not already taken.
+    if config.cameras.iter().any(|c| c.name == new_name) {
+        bail!("a camera named '{}' already exists in config", new_name);
+    }
+
+    // Auto-generated pattern: name with hyphens replaced by underscores.
+    let old_auto = old_name.replace('-', "_");
+    let new_auto = new_name.replace('-', "_");
+
+    let cam = &mut config.cameras[pos];
+    cam.name = new_name.to_string();
+
+    let mut updated_go2rtc = false;
+    if let Some(ref stream) = cam.go2rtc_stream.clone()
+        && *stream == old_auto
+    {
+        cam.go2rtc_stream = Some(new_auto.clone());
+        updated_go2rtc = true;
+    }
+
+    let mut updated_frigate = false;
+    if let Some(ref fname) = cam.frigate_name.clone()
+        && *fname == old_auto
+    {
+        cam.frigate_name = Some(new_auto.clone());
+        updated_frigate = true;
+    }
+
+    let path = config::Config::config_path()?;
+    let content = toml::to_string_pretty(&config).context("serializing config")?;
+    std::fs::write(&path, content)
+        .with_context(|| format!("writing {}", path.display()))?;
+
+    println!("Renamed camera '{}' -> '{}'", old_name, new_name);
+    if updated_go2rtc {
+        println!("  go2rtc_stream: '{}' -> '{}'", old_auto, new_auto);
+    }
+    if updated_frigate {
+        println!("  frigate_name:  '{}' -> '{}'", old_auto, new_auto);
     }
 
     Ok(())
