@@ -6,6 +6,10 @@ mod init;
 mod vendors;
 
 use std::path::PathBuf;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -563,158 +567,6 @@ async fn cmd_snapshot_all(
     Ok(())
 }
 
-async fn cmd_snapshot_watch(
-    config: &config::Config,
-    name: &str,
-    output_dir: PathBuf,
-    interval: Duration,
-) -> Result<()> {
-    let cam_config = config
-        .find_camera(name)
-        .with_context(|| format!("camera '{}' not found in config", name))?;
-    let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
-
-    std::fs::create_dir_all(&output_dir)
-        .with_context(|| format!("creating output directory: {}", output_dir.display()))?;
-
-    println!(
-        "Capturing snapshot from '{}' every {}s into {}",
-        name,
-        interval.as_secs(),
-        output_dir.display()
-    );
-    println!("Press Ctrl+C to stop.");
-
-    loop {
-        match cam.snapshot().await {
-            Ok(snapshot) => {
-                let ts = snapshot.timestamp.format("%Y%m%d_%H%M%S");
-                let filename = format!(
-                    "{}_{}.{}",
-                    snapshot.camera_name,
-                    ts,
-                    snapshot.format.extension()
-                );
-                let path = output_dir.join(&filename);
-                std::fs::write(&path, &snapshot.data)?;
-                println!("  {}", path.display());
-            }
-            Err(e) => {
-                eprintln!("  snapshot failed: {}", e);
-            }
-        }
-        tokio::time::sleep(interval).await;
-    }
-}
-
-async fn cmd_timelapse(
-    config: &config::Config,
-    name: &str,
-    interval: Duration,
-    duration: Duration,
-    output: PathBuf,
-    output_dir: Option<PathBuf>,
-) -> Result<()> {
-    let cam_config = config
-        .find_camera(name)
-        .with_context(|| format!("camera '{}' not found in config", name))?;
-    let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
-
-    let frames_dir = output_dir
-        .clone()
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("camera-cli-timelapse-{}", name)));
-    std::fs::create_dir_all(&frames_dir)
-        .with_context(|| format!("creating frames directory: {}", frames_dir.display()))?;
-
-    let total_frames = (duration.as_secs_f64() / interval.as_secs_f64()).ceil() as u64;
-    println!(
-        "Capturing timelapse from '{}': ~{} frames over {}s (every {}s)",
-        name,
-        total_frames,
-        duration.as_secs(),
-        interval.as_secs()
-    );
-
-    let start = std::time::Instant::now();
-    let mut frame_count: u64 = 0;
-
-    while start.elapsed() < duration {
-        match cam.snapshot().await {
-            Ok(snapshot) => {
-                let filename = format!("frame_{:06}.{}", frame_count, snapshot.format.extension());
-                let path = frames_dir.join(&filename);
-                std::fs::write(&path, &snapshot.data)?;
-                frame_count += 1;
-                println!("  [{}/~{}] {}", frame_count, total_frames, path.display());
-            }
-            Err(e) => {
-                eprintln!("  frame {} failed: {}", frame_count, e);
-            }
-        }
-
-        if start.elapsed() + interval > duration {
-            break;
-        }
-        tokio::time::sleep(interval).await;
-    }
-
-    if frame_count == 0 {
-        bail!("no frames captured — cannot create timelapse");
-    }
-
-    println!(
-        "Assembling {} frames into {}...",
-        frame_count,
-        output.display()
-    );
-
-    let ext = frames_dir
-        .read_dir()?
-        .filter_map(|e| e.ok())
-        .find(|e| e.file_name().to_string_lossy().starts_with("frame_"))
-        .map(|e| {
-            e.path()
-                .extension()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string()
-        })
-        .unwrap_or_else(|| "jpg".to_string());
-
-    let pattern = frames_dir.join(format!("frame_%06d.{}", ext));
-    let fps = "24";
-
-    let status = tokio::process::Command::new("ffmpeg")
-        .args([
-            "-framerate",
-            fps,
-            "-i",
-            &pattern.to_string_lossy(),
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-y",
-        ])
-        .arg(&output)
-        .status()
-        .await
-        .context("failed to run ffmpeg — is it installed?")?;
-
-    if !status.success() {
-        bail!("ffmpeg exited with status {}", status);
-    }
-
-    println!("Timelapse saved to {}", output.display());
-
-    // Clean up temp frames if we created the directory
-    if output_dir.is_none() {
-        std::fs::remove_dir_all(&frames_dir).ok();
-    }
-
-    Ok(())
-}
-
 async fn cmd_stream(
     config: &config::Config,
     name: &str,
@@ -776,6 +628,190 @@ async fn record_rtsp(url: &str, output: &PathBuf, duration: u64) -> Result<()> {
             "copy",
             "-y",
         ])
+        .arg(output)
+        .status()
+        .await
+        .context("failed to run ffmpeg — is it installed?")?;
+
+    if !status.success() {
+        bail!("ffmpeg exited with status {}", status);
+    }
+    Ok(())
+}
+
+/// Watch mode: capture a snapshot every `interval` indefinitely until Ctrl+C.
+async fn cmd_snapshot_watch(
+    config: &config::Config,
+    name: &str,
+    output_dir: PathBuf,
+    interval: Duration,
+) -> Result<()> {
+    let cam_config = config
+        .find_camera(name)
+        .with_context(|| format!("camera '{}' not found in config", name))?;
+    let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
+
+    std::fs::create_dir_all(&output_dir)
+        .with_context(|| format!("creating output directory: {}", output_dir.display()))?;
+
+    println!(
+        "Watching '{}' — capturing every {} — saving to {} — Ctrl+C to stop",
+        name,
+        humantime::format_duration(interval),
+        output_dir.display()
+    );
+
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await; // consume the immediate first tick
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                match cam.snapshot().await {
+                    Ok(snapshot) => {
+                        let ts = snapshot.timestamp.format("%Y%m%d_%H%M%S");
+                        let filename = format!(
+                            "{}_{}.{}",
+                            snapshot.camera_name,
+                            ts,
+                            snapshot.format.extension()
+                        );
+                        let path = output_dir.join(&filename);
+                        match std::fs::write(&path, &snapshot.data) {
+                            Ok(()) => println!("Saved {}", path.display()),
+                            Err(e) => eprintln!("Warning: failed to write {}: {}", path.display(), e),
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: snapshot failed for '{}': {}", name, e);
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                println!("\nStopped watch mode for '{}'.", name);
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_timelapse(
+    config: &config::Config,
+    name: &str,
+    interval: Duration,
+    total_duration: Duration,
+    output: PathBuf,
+    output_dir: Option<PathBuf>,
+) -> Result<()> {
+    let cam_config = config
+        .find_camera(name)
+        .with_context(|| format!("camera '{}' not found in config", name))?;
+    let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
+
+    let (frames_dir, keep_frames) = match output_dir {
+        Some(ref dir) => {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("creating frames directory: {}", dir.display()))?;
+            (dir.clone(), true)
+        }
+        None => {
+            let tmp = std::env::temp_dir().join(format!(
+                "camera-cli-timelapse-{}",
+                chrono::Utc::now().timestamp()
+            ));
+            std::fs::create_dir_all(&tmp)
+                .with_context(|| format!("creating temp frames directory: {}", tmp.display()))?;
+            (tmp, false)
+        }
+    };
+
+    let total_frames = {
+        let secs = total_duration.as_secs_f64();
+        let step = interval.as_secs_f64();
+        (secs / step).ceil() as u64
+    };
+
+    println!(
+        "Timelapse '{}': {} frames every {} — total {} — output {}",
+        name,
+        total_frames,
+        humantime::format_duration(interval),
+        humantime::format_duration(total_duration),
+        output.display(),
+    );
+    println!("Press Ctrl+C to stop early and stitch whatever was captured.");
+
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let interrupted_signal = interrupted.clone();
+
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        interrupted_signal.store(true, Ordering::SeqCst);
+        eprintln!("\nInterrupted — will stitch captured frames...");
+    });
+
+    let mut captured: u64 = 0;
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let deadline = tokio::time::Instant::now() + total_duration;
+
+    loop {
+        if interrupted.load(Ordering::SeqCst) {
+            break;
+        }
+
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = tokio::time::sleep_until(deadline) => { break; }
+        }
+
+        if tokio::time::Instant::now() >= deadline || interrupted.load(Ordering::SeqCst) {
+            break;
+        }
+
+        match cam.snapshot().await {
+            Ok(snapshot) => {
+                captured += 1;
+                let frame_path = frames_dir.join(format!("frame_{:04}.jpg", captured));
+                std::fs::write(&frame_path, &snapshot.data)
+                    .with_context(|| format!("writing frame {}", captured))?;
+                println!(
+                    "[{}/{}] Captured snapshot ({})",
+                    captured, total_frames, name
+                );
+            }
+            Err(e) => {
+                eprintln!("Warning: snapshot failed for '{}': {}", name, e);
+            }
+        }
+    }
+
+    if captured == 0 {
+        bail!("no frames were captured — cannot create timelapse");
+    }
+
+    println!("Stitching {} frames into {}...", captured, output.display());
+    stitch_timelapse(&frames_dir, &output).await?;
+    println!("Timelapse saved to {}", output.display());
+
+    if !keep_frames {
+        let _ = std::fs::remove_dir_all(&frames_dir);
+    }
+
+    Ok(())
+}
+
+/// Run ffmpeg to stitch sequentially-numbered JPEG frames into an MP4 at 30 fps.
+async fn stitch_timelapse(frames_dir: &std::path::Path, output: &std::path::Path) -> Result<()> {
+    let input_pattern = frames_dir.join("frame_%04d.jpg");
+
+    let status = tokio::process::Command::new("ffmpeg")
+        .args(["-framerate", "30", "-i"])
+        .arg(&input_pattern)
+        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-y"])
         .arg(output)
         .status()
         .await
