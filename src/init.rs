@@ -12,7 +12,7 @@ use crate::discovery::{DiscoveredCamera, discover_cameras};
 ///
 /// "Reolink Video Doorbell WiFi" at 192.168.1.215 → "doorbell-215"
 /// Unknown at 192.168.1.97 → "camera-97"
-fn default_camera_name(model: Option<&str>, address: &str) -> String {
+pub(crate) fn default_camera_name(model: Option<&str>, address: &str) -> String {
     let last_octet = address
         .rsplit('.')
         .next()
@@ -41,7 +41,7 @@ fn default_camera_name(model: Option<&str>, address: &str) -> String {
 // ── camera type inference ─────────────────────────────────────────────────────
 
 /// Infer camera type from manufacturer string, if possible.
-fn infer_camera_type(manufacturer: Option<&str>) -> Option<CameraType> {
+pub(crate) fn infer_camera_type(manufacturer: Option<&str>) -> Option<CameraType> {
     let m = manufacturer?.to_lowercase();
     if m.contains("reolink") {
         Some(CameraType::Reolink)
@@ -102,7 +102,7 @@ fn prompt_password(label: &str) -> Result<String> {
 
 /// Interactively ask the user about a discovered camera.
 /// Returns `Some(CameraConfig)` if the user wants to add it, `None` otherwise.
-fn prompt_for_camera(cam: &DiscoveredCamera) -> Result<Option<CameraConfig>> {
+pub(crate) fn prompt_for_camera(cam: &DiscoveredCamera) -> Result<Option<CameraConfig>> {
     let display = match (&cam.manufacturer, &cam.model) {
         (Some(mfr), Some(mdl)) => format!("{} {}", mfr, mdl),
         (Some(mfr), None) => mfr.clone(),
@@ -168,7 +168,7 @@ fn prompt_for_camera(cam: &DiscoveredCamera) -> Result<Option<CameraConfig>> {
 // ── auto-mode camera builder ──────────────────────────────────────────────────
 
 /// Build a CameraConfig from a discovered camera using defaults (no passwords).
-fn auto_camera_config(cam: &DiscoveredCamera) -> Option<CameraConfig> {
+pub(crate) fn auto_camera_config(cam: &DiscoveredCamera) -> Option<CameraConfig> {
     let camera_type = infer_camera_type(cam.manufacturer.as_deref())?;
     let name = default_camera_name(cam.model.as_deref(), &cam.address);
 

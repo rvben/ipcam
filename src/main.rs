@@ -172,11 +172,15 @@ enum Command {
         action: Option<ConfigAction>,
     },
 
-    /// Discover cameras on the local network via ONVIF WS-Discovery
+    /// Discover cameras on the network and add them to the config
     Discover {
         /// How long to wait for responses (seconds)
-        #[arg(short, long, default_value = "3")]
+        #[arg(short, long, default_value = "5")]
         timeout: u64,
+
+        /// Only list discovered cameras, don't add them
+        #[arg(long)]
+        no_add: bool,
     },
 
     /// Watch for motion and doorbell events
@@ -269,12 +273,13 @@ enum Command {
         new_name: String,
     },
 
-    /// Manually add a camera to the config
+    /// Add a camera to the config manually
     Add {
         /// IP address of the camera
+        #[arg(long)]
         host: String,
 
-        /// Camera name (default: auto-generated from last octet, e.g. "camera-215")
+        /// Camera name (default: auto-generated from last octet)
         #[arg(long)]
         name: Option<String>,
 
@@ -572,7 +577,13 @@ async fn run_with(cli: Cli) -> Result<()> {
             ConfigAction::Edit => cmd_config_edit(),
             ConfigAction::Show => cmd_config_show(cli.json, cli.config.as_deref()),
         },
-        Command::Discover { timeout } => cmd_discover(timeout, cli.json, &config).await,
+        Command::Discover { timeout, no_add } => {
+            if no_add {
+                cmd_discover(timeout, cli.json, &config).await
+            } else {
+                cmd_add_discover(&config, cli.config.as_deref(), cli.json, timeout).await
+            }
+        }
         Command::Events { camera, watch } => cmd_events(&config, &camera, watch, cli.json).await,
         Command::Status { camera } => cmd_status(&config, camera.as_deref(), cli.json).await,
         Command::Frigate { action } => cmd_frigate(&config, action, cli.json).await,
@@ -597,7 +608,7 @@ async fn run_with(cli: Cli) -> Result<()> {
             password,
             rtsp_port,
             go2rtc_stream,
-        } => cmd_add(&host, name.as_deref(), r#type, &username, password.as_deref(), rtsp_port, go2rtc_stream.as_deref(), cli.config.as_deref(), cli.json),
+        } => cmd_add_direct(&host, name.as_deref(), r#type, &username, password.as_deref(), rtsp_port, go2rtc_stream.as_deref(), cli.config.as_deref(), cli.json),
         Command::Remove { name, yes } => cmd_remove(&name, yes, cli.config.as_deref(), cli.json),
         Command::Completions { .. } | Command::Init { .. } => {
             unreachable!("handled before config load")
@@ -2163,7 +2174,7 @@ async fn cmd_test(config: &config::Config, camera: Option<&str>, json: bool) -> 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn cmd_add(
+fn cmd_add_direct(
     host: &str,
     name: Option<&str>,
     camera_type_arg: CameraTypeArg,
@@ -2242,6 +2253,139 @@ fn cmd_add(
             "Added camera '{}' ({} @ {})",
             resolved_name, camera_type, host
         );
+    }
+
+    Ok(())
+}
+
+async fn cmd_add_discover(
+    config: &config::Config,
+    config_path: Option<&Path>,
+    json: bool,
+    timeout: u64,
+) -> Result<()> {
+    use crate::discovery::discover_cameras;
+    use crate::init::{auto_camera_config, infer_camera_type, prompt_for_camera};
+
+    let existing_hosts: std::collections::HashSet<&str> =
+        config.cameras.iter().map(|c| c.host.as_str()).collect();
+
+    if !json {
+        println!("Scanning network for cameras...");
+    }
+
+    let discovered =
+        discover_cameras(Duration::from_secs(timeout), Some(config)).await?;
+
+    // Filter out cameras already in config
+    let new_cameras: Vec<_> = discovered
+        .iter()
+        .filter(|c| !existing_hosts.contains(c.address.as_str()))
+        .collect();
+
+    if new_cameras.is_empty() {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "discovered": discovered.len(),
+                    "new": 0,
+                    "added": [],
+                    "skipped": [],
+                })
+            );
+        } else {
+            println!(
+                "Found {} camera(s), all already configured.",
+                discovered.len()
+            );
+        }
+        return Ok(());
+    }
+
+    if !json {
+        println!("Found {} new camera(s):\n", new_cameras.len());
+        for (i, cam) in new_cameras.iter().enumerate() {
+            let display = match (&cam.manufacturer, &cam.model) {
+                (Some(mfr), Some(mdl)) => format!("{} ({})", mfr, mdl),
+                (Some(mfr), None) => mfr.clone(),
+                (None, Some(mdl)) => mdl.clone(),
+                (None, None) => "Unknown".to_string(),
+            };
+            let type_hint = infer_camera_type(cam.manufacturer.as_deref())
+                .map(|t| format!(" [{}]", t))
+                .unwrap_or_default();
+            println!("  {}. {} — {}{}", i + 1, cam.address, display, type_hint);
+        }
+
+        if !config.cameras.is_empty() {
+            let names: Vec<&str> = config.cameras.iter().map(|c| c.name.as_str()).collect();
+            println!("\nAlready configured: {}", names.join(", "));
+        }
+    }
+
+    let mut added = Vec::new();
+    let mut skipped = Vec::new();
+    let mut cfg = config.clone();
+
+    if json {
+        // Auto mode: add all cameras we can infer a type for
+        for cam in &new_cameras {
+            match auto_camera_config(cam) {
+                Some(c) => {
+                    added.push(serde_json::json!({
+                        "name": c.name,
+                        "host": c.host,
+                        "type": c.camera_type.to_string(),
+                    }));
+                    cfg.cameras.push(c);
+                }
+                None => {
+                    skipped.push(serde_json::json!({
+                        "host": cam.address,
+                        "reason": "could not infer camera type",
+                        "manufacturer": cam.manufacturer,
+                    }));
+                }
+            }
+        }
+    } else {
+        // Interactive mode: prompt for each camera
+        for cam in &new_cameras {
+            if let Some(c) = prompt_for_camera(cam)? {
+                added.push(serde_json::json!({
+                    "name": c.name,
+                    "host": c.host,
+                    "type": c.camera_type.to_string(),
+                }));
+                cfg.cameras.push(c);
+            }
+        }
+    }
+
+    if !added.is_empty() {
+        let path = config_path
+            .map(|p| p.to_path_buf())
+            .unwrap_or(config::Config::config_path()?);
+        let content = toml::to_string_pretty(&cfg).context("serializing config")?;
+        std::fs::write(&path, content)
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "discovered": discovered.len(),
+                "new": new_cameras.len(),
+                "added": added,
+                "skipped": skipped,
+            })
+        );
+    } else if added.is_empty() {
+        println!("\nNo cameras added.");
+    } else {
+        println!("\nAdded {} camera(s).", added.len());
     }
 
     Ok(())

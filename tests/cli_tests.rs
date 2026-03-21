@@ -71,7 +71,21 @@ fn test_config_plain_shows_path() {
 // ── discover ────────────────────────────────────────────────────────
 
 #[test]
-fn test_discover_json_returns_valid_json_array() {
+fn test_discover_no_add_json_returns_array() {
+    let output = ipcam()
+        .args(["--json", "discover", "--no-add", "--timeout", "1"])
+        .output()
+        .expect("failed to run ipcam");
+
+    assert!(output.status.success());
+
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("discover --no-add --json should produce valid JSON");
+    assert!(parsed.is_array(), "discover --no-add --json should return an array");
+}
+
+#[test]
+fn test_discover_json_returns_object_with_discovered() {
     let output = ipcam()
         .args(["--json", "discover", "--timeout", "1"])
         .output()
@@ -81,7 +95,9 @@ fn test_discover_json_returns_valid_json_array() {
 
     let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)
         .expect("discover --json should produce valid JSON");
-    assert!(parsed.is_array(), "discover --json should return an array");
+    assert!(parsed.is_object(), "discover --json should return an object");
+    assert!(parsed.get("discovered").is_some(), "should contain 'discovered'");
+    assert!(parsed.get("added").is_some(), "should contain 'added'");
 }
 
 // ── no subcommand ───────────────────────────────────────────────────
