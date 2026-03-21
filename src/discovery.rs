@@ -44,7 +44,7 @@ fn build_probe_message(uuid: &str) -> String {
 
 /// Extract text content of a named XML element from a response string.
 /// Returns all occurrences.
-fn extract_xml_elements(xml: &str, local_name: &str) -> Vec<String> {
+pub fn extract_xml_elements(xml: &str, local_name: &str) -> Vec<String> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 

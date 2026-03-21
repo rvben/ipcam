@@ -160,6 +160,8 @@ fn prompt_for_camera(cam: &DiscoveredCamera) -> Result<Option<CameraConfig>> {
         go2rtc_stream: None,
         onvif_port: None,
         frigate_name: None,
+        main_stream: None,
+        sub_stream: None,
     }))
 }
 
@@ -180,6 +182,8 @@ fn auto_camera_config(cam: &DiscoveredCamera) -> Option<CameraConfig> {
         go2rtc_stream: None,
         onvif_port: None,
         frigate_name: None,
+        main_stream: None,
+        sub_stream: None,
     })
 }
 

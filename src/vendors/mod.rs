@@ -1,3 +1,4 @@
+pub mod onvif;
 pub mod reolink;
 pub mod tapo;
 
@@ -13,5 +14,6 @@ pub fn create_camera(
     match config.camera_type {
         CameraType::Tapo => Ok(Box::new(tapo::TapoCamera::new(config, go2rtc)?)),
         CameraType::Reolink => Ok(Box::new(reolink::ReolinkCamera::new(config)?)),
+        CameraType::Onvif => Ok(Box::new(onvif::OnvifCamera::new(config, go2rtc)?)),
     }
 }

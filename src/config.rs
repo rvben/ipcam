@@ -63,6 +63,10 @@ pub struct CameraConfig {
     pub onvif_port: Option<u16>,
     /// Frigate camera name (Frigate uses underscores, e.g. "front_door")
     pub frigate_name: Option<String>,
+    /// Custom RTSP main stream path (default varies by vendor)
+    pub main_stream: Option<String>,
+    /// Custom RTSP sub stream path (default varies by vendor)
+    pub sub_stream: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -70,6 +74,7 @@ pub struct CameraConfig {
 pub enum CameraType {
     Tapo,
     Reolink,
+    Onvif,
 }
 
 impl std::fmt::Display for CameraType {
@@ -77,6 +82,7 @@ impl std::fmt::Display for CameraType {
         match self {
             Self::Tapo => write!(f, "tapo"),
             Self::Reolink => write!(f, "reolink"),
+            Self::Onvif => write!(f, "onvif"),
         }
     }
 }
@@ -87,6 +93,7 @@ impl CameraConfig {
         self.onvif_port.unwrap_or(match self.camera_type {
             CameraType::Tapo => 2020,
             CameraType::Reolink => 8000,
+            CameraType::Onvif => 80,
         })
     }
 
@@ -238,6 +245,8 @@ go2rtc_stream = "kids_room"
             go2rtc_stream: None,
             onvif_port: None,
             frigate_name: None,
+            main_stream: None,
+            sub_stream: None,
         }
     }
 
@@ -477,5 +486,55 @@ host = "10.0.0.1"
     fn camera_type_display() {
         assert_eq!(CameraType::Tapo.to_string(), "tapo");
         assert_eq!(CameraType::Reolink.to_string(), "reolink");
+        assert_eq!(CameraType::Onvif.to_string(), "onvif");
+    }
+
+    // --- Onvif camera type ---
+
+    #[test]
+    fn onvif_port_onvif_default() {
+        assert_eq!(make_camera(CameraType::Onvif).onvif_port(), 80);
+    }
+
+    #[test]
+    fn camera_type_deserialize_onvif() {
+        let toml_str = r#"
+[[cameras]]
+name = "garage"
+type = "onvif"
+host = "192.168.1.50"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.cameras[0].camera_type, CameraType::Onvif);
+    }
+
+    #[test]
+    fn parse_custom_stream_paths() {
+        let toml_str = r#"
+[[cameras]]
+name = "garage"
+type = "onvif"
+host = "192.168.1.50"
+main_stream = "Streaming/Channels/101"
+sub_stream = "Streaming/Channels/102"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let cam = &config.cameras[0];
+        assert_eq!(cam.main_stream.as_deref(), Some("Streaming/Channels/101"));
+        assert_eq!(cam.sub_stream.as_deref(), Some("Streaming/Channels/102"));
+    }
+
+    #[test]
+    fn stream_paths_optional() {
+        let toml_str = r#"
+[[cameras]]
+name = "garage"
+type = "onvif"
+host = "192.168.1.50"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let cam = &config.cameras[0];
+        assert!(cam.main_stream.is_none());
+        assert!(cam.sub_stream.is_none());
     }
 }
