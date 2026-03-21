@@ -297,6 +297,25 @@ impl Camera for OnvifCamera {
         );
         self.send_ptz_soap(&body).await
     }
+
+    async fn ptz_zoom(&self, speed: f32) -> Result<()> {
+        let body = format!(
+            r#"<tptz:ContinuousMove xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
+  <tptz:ProfileToken>profile_1</tptz:ProfileToken>
+  <tptz:Velocity>
+    <tt:Zoom x="{speed}" xmlns:tt="http://www.onvif.org/ver10/schema"/>
+  </tptz:Velocity>
+</tptz:ContinuousMove>"#,
+        );
+        self.send_ptz_soap(&body).await
+    }
+
+    async fn ptz_home(&self) -> Result<()> {
+        let body = r#"<tptz:GotoHomePosition xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
+  <tptz:ProfileToken>profile_1</tptz:ProfileToken>
+</tptz:GotoHomePosition>"#;
+        self.send_ptz_soap(body).await
+    }
 }
 
 #[cfg(test)]

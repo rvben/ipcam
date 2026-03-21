@@ -239,6 +239,30 @@ impl Camera for ReolinkCamera {
         }
         Ok(())
     }
+
+    async fn ptz_zoom(&self, speed: f32) -> Result<()> {
+        let op = if speed > 0.0 { "ZoomInc" } else { "ZoomDec" };
+        let url = self.api_url("PtzCtrl");
+        let body = serde_json::json!([{
+            "cmd": "PtzCtrl",
+            "action": 0,
+            "param": {
+                "channel": 0,
+                "op": op,
+                "speed": (speed.abs() * 64.0) as u32,
+            }
+        }]);
+        let resp = self.client.post(&url).json(&body).send().await?;
+        let data: serde_json::Value = resp.json().await?;
+        if data[0]["code"].as_i64() != Some(0) {
+            bail!("PTZ zoom failed: {}", data);
+        }
+        Ok(())
+    }
+
+    async fn ptz_home(&self) -> Result<()> {
+        self.ptz_goto_preset(0).await
+    }
 }
 
 #[cfg(test)]

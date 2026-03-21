@@ -165,4 +165,10 @@ pub trait Camera: Send + Sync {
 
     /// Go to a PTZ preset position
     async fn ptz_goto_preset(&self, preset: u32) -> Result<()>;
+
+    /// Zoom in or out (positive = zoom in, negative = zoom out)
+    async fn ptz_zoom(&self, speed: f32) -> Result<()>;
+
+    /// Go to home position
+    async fn ptz_home(&self) -> Result<()>;
 }
