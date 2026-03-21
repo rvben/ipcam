@@ -21,12 +21,15 @@ A command-line tool for managing IP cameras (Tapo, Reolink) via RTSP and vendor 
 
 ## Installation
 
-### Prerequisites
+### Homebrew (macOS/Linux)
 
-- Rust toolchain (install via [rustup](https://rustup.rs))
-- [ffmpeg](https://ffmpeg.org/download.html) — required for snapshots, recording, and timelapse
+```bash
+brew install rvben/tap/ipcam
+```
 
-### Build and install
+### From source
+
+**Prerequisites:** Rust toolchain ([rustup](https://rustup.rs)) and [ffmpeg](https://ffmpeg.org/download.html).
 
 ```bash
 cargo install --path .
@@ -131,6 +134,8 @@ frigate_name = "backyard_cam"
 | `snapshot --grid` | Capture from all cameras and tile into a single image |
 | `snapshot --every <interval>` | Capture snapshots on a repeating interval |
 | `snapshot-all` | Alias for `snapshot --all` |
+| `live <camera>` | Live view in the terminal (or `--window` for ffplay) |
+| `preview <camera>` | Display a camera snapshot in the terminal |
 | `stream <camera>` | Print the RTSP URL, or pipe to a file with `--output` |
 | `record <camera>` | Record a video clip (default 30 s) |
 | `timelapse <camera>` | Capture frames at an interval and encode to MP4 |
@@ -142,10 +147,21 @@ frigate_name = "backyard_cam"
 | `discover` | Scan the network for ONVIF cameras |
 | `frigate events` | List recent Frigate NVR events |
 | `frigate snapshot <camera>` | Fetch the latest snapshot from Frigate |
+| `add <host>` | Manually add a camera to the config |
+| `remove <name>` | Remove a camera from the config |
+| `rename <old> <new>` | Rename a camera in the config |
 | `config` | Show the config file path and whether it exists |
+| `config show` | Print the current config (passwords masked) |
+| `config edit` | Open the config file in `$EDITOR` |
 | `completions <shell>` | Print a shell completion script |
 
-All commands accept `--json` for machine-readable output and `--config <path>` to override the config file location.
+### Global flags
+
+| Flag | Description |
+|---|---|
+| `--json` | Machine-readable JSON output (works with `snapshot`, `config`, `stream`, `record`, and more) |
+| `--quiet` / `-q` | Suppress informational output |
+| `--config <path>` | Override the config file location |
 
 ## Examples
 
@@ -166,6 +182,26 @@ ipcam snapshot --grid --output-dir /tmp/
 
 # Capture every 5 minutes, save timestamped files
 ipcam snapshot front-door --every 5m --output-dir /tmp/front-door/
+```
+
+### Live view
+
+```bash
+# Inline terminal view (refreshes continuously)
+ipcam live front-door
+
+# Open in a separate ffplay window
+ipcam live front-door --window
+
+# Use the sub-stream for lower bandwidth
+ipcam live front-door -q sub
+```
+
+### Terminal preview
+
+```bash
+# Display a one-shot snapshot in the terminal
+ipcam preview front-door
 ```
 
 ### Status and test
@@ -286,6 +322,10 @@ ipcam frigate snapshot front_door --output /tmp/latest.jpg
 ```
 
 Frigate camera names use underscores (e.g. `front_door`). Set `frigate_name` in the camera config if the name differs from your ipcam name.
+
+## Credential Safety
+
+Passwords are masked with `****` in `config show` output. RTSP and HTTPS URLs containing credentials are automatically redacted in error messages, so passwords are never leaked to the terminal or logs.
 
 ## License
 
