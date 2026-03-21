@@ -1,4 +1,5 @@
-use std::io;
+use std::io::{self, Write as _};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -6,14 +7,14 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 use ratatui::Terminal;
 
 use crate::camera::{HealthStatus, StreamQuality};
-use crate::config::{CameraConfig, Config};
+use crate::config::{CameraConfig, Config, Go2rtcConfig};
 use crate::vendors;
 
 struct CameraStatus {
@@ -26,25 +27,69 @@ struct CameraStatus {
     refreshing: bool,
 }
 
+struct FrameGrabber {
+    handle: tokio::task::JoinHandle<()>,
+    frame_path: PathBuf,
+}
+
+impl FrameGrabber {
+    fn start(camera_idx: usize, rtsp_url: &str) -> Self {
+        let frame_path = std::env::temp_dir().join(format!("ipcam_tui_{}.jpg", camera_idx));
+        let url = rtsp_url.to_string();
+        let path = frame_path.clone();
+        let handle = tokio::spawn(async move {
+            grab_frames_loop(&url, &path).await;
+        });
+        Self { handle, frame_path }
+    }
+
+    fn shutdown(self) {
+        self.handle.abort();
+        let _ = std::fs::remove_file(&self.frame_path);
+    }
+}
+
 struct App {
     cameras: Vec<CameraStatus>,
     table_state: TableState,
     last_refresh: Instant,
     online_count: usize,
+    preview_camera: Option<usize>,
+    preview_area: Option<Rect>,
+    grabber: Option<FrameGrabber>,
+    health_rx: tokio::sync::mpsc::Receiver<Vec<HealthStatus>>,
+    health_pending: bool,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(health_rx: tokio::sync::mpsc::Receiver<Vec<HealthStatus>>) -> Self {
         Self {
             cameras: Vec::new(),
             table_state: TableState::default(),
             last_refresh: Instant::now(),
             online_count: 0,
+            preview_camera: None,
+            preview_area: None,
+            grabber: None,
+            health_rx,
+            health_pending: false,
         }
     }
 
     fn update_counts(&mut self) {
         self.online_count = self.cameras.iter().filter(|c| c.status.online).count();
+    }
+
+    fn try_recv_health(&mut self) {
+        if let Ok(results) = self.health_rx.try_recv() {
+            for (cam, status) in self.cameras.iter_mut().zip(results) {
+                cam.status = status;
+                cam.refreshing = false;
+            }
+            self.last_refresh = Instant::now();
+            self.update_counts();
+            self.health_pending = false;
+        }
     }
 
     fn selected_camera(&self) -> Option<&CameraStatus> {
@@ -74,9 +119,29 @@ impl App {
         };
         self.table_state.select(Some(i));
     }
+
+    fn toggle_preview(&mut self) {
+        let selected = self.table_state.selected();
+        if self.preview_camera == selected {
+            self.close_preview();
+        } else if let Some(idx) = selected {
+            self.close_preview();
+            let rtsp_url = self.cameras[idx].rtsp_url.clone();
+            self.preview_camera = Some(idx);
+            self.grabber = Some(FrameGrabber::start(idx, &rtsp_url));
+        }
+    }
+
+    fn close_preview(&mut self) {
+        self.preview_camera = None;
+        self.preview_area = None;
+        if let Some(g) = self.grabber.take() {
+            g.shutdown();
+        }
+    }
 }
 
-fn build_camera_status(cam_config: &CameraConfig, go2rtc: Option<&crate::config::Go2rtcConfig>) -> CameraStatus {
+fn build_camera_status(cam_config: &CameraConfig, go2rtc: Option<&Go2rtcConfig>) -> CameraStatus {
     let rtsp_url = vendors::create_camera(cam_config, go2rtc)
         .map(|c| c.rtsp_url(StreamQuality::Main))
         .unwrap_or_default();
@@ -95,13 +160,21 @@ fn build_camera_status(cam_config: &CameraConfig, go2rtc: Option<&crate::config:
     }
 }
 
-async fn poll_cameras(config: &Config, cameras: &mut [CameraStatus]) {
-    let futs: Vec<_> = config
+/// Spawn a non-blocking health check for all cameras.
+fn spawn_health_check(
+    config: &Config,
+    tx: &tokio::sync::mpsc::Sender<Vec<HealthStatus>>,
+) {
+    let cameras: Vec<_> = config
         .cameras
         .iter()
-        .map(|cam_config| {
-            let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref());
-            async move {
+        .map(|c| vendors::create_camera(c, config.go2rtc.as_ref()))
+        .collect();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let futs: Vec<_> = cameras
+            .into_iter()
+            .map(|cam| async move {
                 match cam {
                     Ok(c) => c.is_reachable().await,
                     Err(e) => HealthStatus {
@@ -110,19 +183,65 @@ async fn poll_cameras(config: &Config, cameras: &mut [CameraStatus]) {
                         latency: Duration::ZERO,
                     },
                 }
-            }
-        })
-        .collect();
+            })
+            .collect();
+        let results = futures::future::join_all(futs).await;
+        let _ = tx.send(results).await;
+    });
+}
 
-    let results = futures::future::join_all(futs).await;
-    for (cam, status) in cameras.iter_mut().zip(results) {
-        cam.status = status;
-        cam.refreshing = false;
+async fn grab_frames_loop(rtsp_url: &str, output_path: &std::path::Path) {
+    loop {
+        // Single long-running ffmpeg process that continuously overwrites the frame.
+        // kill_on_drop ensures ffmpeg is killed when the task is aborted.
+        let mut child = match tokio::process::Command::new("ffmpeg")
+            .args([
+                "-rtsp_transport",
+                "tcp",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                rtsp_url,
+                "-vf",
+                "fps=2",
+                "-update",
+                "1",
+            ])
+            .arg(output_path.as_os_str())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return,
+        };
+
+        // Wait for process to exit (camera offline, error, etc.)
+        let _ = child.wait().await;
+
+        // Retry after delay
+        tokio::time::sleep(Duration::from_secs(3)).await;
     }
 }
 
 fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     terminal.draw(|frame| {
+        let area = frame.area();
+
+        // Horizontal split when preview is active
+        let (left_area, preview_rect) = if app.preview_camera.is_some() {
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(area);
+            (chunks[0], Some(chunks[1]))
+        } else {
+            (area, None)
+        };
+
+        // Left side: header, table, detail, footer
         let has_selection = app.selected_camera().is_some();
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -141,17 +260,26 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
                     Constraint::Length(1),
                 ]
             })
-            .split(frame.area());
+            .split(left_area);
 
-        // Header (compact, no border)
+        // Header
         let elapsed = app.last_refresh.elapsed().as_secs();
         let total = app.cameras.len();
         let online = app.online_count;
         let header = Line::from(vec![
-            Span::styled(" ipcam ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " ipcam ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 format!("{}/{} online", online, total),
-                Style::default().fg(if online == total { Color::Green } else { Color::Yellow }),
+                Style::default().fg(if online == total {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                }),
             ),
             Span::styled(
                 format!("  {}s ago", elapsed),
@@ -216,10 +344,14 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
 
         frame.render_stateful_widget(table, main_chunks[1], &mut app.table_state);
 
-        // Detail panel (only if a camera is selected)
+        // Detail panel
         if let Some(cam) = app.selected_camera() {
             let status_label = if cam.status.online { "online" } else { "offline" };
-            let status_color = if cam.status.online { Color::Green } else { Color::Red };
+            let status_color = if cam.status.online {
+                Color::Green
+            } else {
+                Color::Red
+            };
             let details = vec![
                 Line::from(vec![
                     Span::styled("  Host: ", Style::default().fg(Color::DarkGray)),
@@ -243,22 +375,83 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
                     Span::raw(format!("{}ms", cam.status.latency.as_millis())),
                 ]),
             ];
-            let detail_block = Paragraph::new(details)
-                .block(Block::default().borders(Borders::ALL).title(format!(" {} ", cam.name)));
+            let detail_block = Paragraph::new(details).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" {} ", cam.name)),
+            );
             frame.render_widget(detail_block, main_chunks[2]);
         }
 
-        // Footer (compact, no border)
-        let footer = Line::from(vec![
+        // Footer
+        let mut footer_spans = vec![
             Span::styled(" q", Style::default().fg(Color::Yellow)),
             Span::raw(" quit  "),
             Span::styled("r", Style::default().fg(Color::Yellow)),
             Span::raw(" refresh  "),
             Span::styled("j/k", Style::default().fg(Color::Yellow)),
-            Span::raw(" navigate"),
-        ]);
-        frame.render_widget(Paragraph::new(footer), main_chunks[3]);
+            Span::raw(" navigate  "),
+            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+        ];
+        if app.preview_camera.is_some() {
+            footer_spans.push(Span::raw(" close preview"));
+        } else {
+            footer_spans.push(Span::raw(" live preview"));
+        }
+        frame.render_widget(Paragraph::new(Line::from(footer_spans)), main_chunks[3]);
+
+        // Preview pane (border + placeholder text; actual image rendered after draw)
+        if let Some(rect) = preview_rect {
+            let cam_name = app
+                .preview_camera
+                .and_then(|i| app.cameras.get(i))
+                .map(|c| c.name.as_str())
+                .unwrap_or("Preview");
+
+            let has_frame = app
+                .grabber
+                .as_ref()
+                .is_some_and(|g| g.frame_path.exists());
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {} - Live ", cam_name));
+            let inner = block.inner(rect);
+            frame.render_widget(block, rect);
+
+            if !has_frame {
+                let msg = Paragraph::new("Connecting...")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::DarkGray));
+                frame.render_widget(msg, inner);
+            }
+
+            app.preview_area = Some(inner);
+        } else {
+            app.preview_area = None;
+        }
     })?;
+
+    // Render preview image after ratatui flush (viuer writes directly to stdout)
+    if let Some(ref grabber) = app.grabber
+        && let Some(area) = app.preview_area
+        && area.width > 0
+        && area.height > 0
+        && grabber.frame_path.exists()
+    {
+        let conf = viuer::Config {
+            absolute_offset: true,
+            x: area.x,
+            y: area.y as i16,
+            width: Some(u32::from(area.width)),
+            height: Some(u32::from(area.height)),
+            restore_cursor: true,
+            ..Default::default()
+        };
+        let _ = viuer::print_from_file(&grabber.frame_path, &conf);
+        let _ = io::stdout().flush();
+    }
+
     Ok(())
 }
 
@@ -272,11 +465,9 @@ pub async fn run_tui(config: &Config, interval: u64) -> Result<()> {
         anyhow::bail!("no cameras configured");
     }
 
-    // Setup terminal
     terminal::enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
 
-    // Ensure terminal is restored on panic
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore_terminal();
@@ -286,10 +477,10 @@ pub async fn run_tui(config: &Config, interval: u64) -> Result<()> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new();
+    let (health_tx, health_rx) = tokio::sync::mpsc::channel(1);
+    let mut app = App::new(health_rx);
     let refresh_interval = Duration::from_secs(interval);
 
-    // Build initial camera list with "checking..." status
     app.cameras = config
         .cameras
         .iter()
@@ -299,48 +490,70 @@ pub async fn run_tui(config: &Config, interval: u64) -> Result<()> {
         app.table_state.select(Some(0));
     }
 
-    // Draw immediately so user sees something while first poll runs
     draw(&mut terminal, &mut app)?;
 
-    // Initial poll
-    poll_cameras(config, &mut app.cameras).await;
-    app.last_refresh = Instant::now();
-    app.update_counts();
+    // Initial health check (non-blocking)
+    spawn_health_check(config, &health_tx);
+    app.health_pending = true;
 
     loop {
+        // Check for background health check results
+        app.try_recv_health();
+
         draw(&mut terminal, &mut app)?;
 
-        // Use a short poll timeout so the elapsed counter updates frequently
-        let poll_timeout = Duration::from_secs(1)
-            .min(refresh_interval.saturating_sub(app.last_refresh.elapsed()));
+        // Shorter poll when preview is active for smoother image updates
+        let base_timeout = if app.preview_camera.is_some() {
+            Duration::from_millis(200)
+        } else {
+            Duration::from_secs(1)
+        };
+        let poll_timeout =
+            base_timeout.min(refresh_interval.saturating_sub(app.last_refresh.elapsed()));
 
-        if event::poll(poll_timeout)? {
-            if let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-            {
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Char('r') => {
-                        for cam in &mut app.cameras {
-                            cam.refreshing = true;
-                        }
-                        draw(&mut terminal, &mut app)?;
-                        poll_cameras(config, &mut app.cameras).await;
-                        app.last_refresh = Instant::now();
-                        app.update_counts();
+        if event::poll(poll_timeout)?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            let prev_preview = app.preview_camera;
+            match key.code {
+                KeyCode::Char('q') => break,
+                KeyCode::Esc => {
+                    if app.preview_camera.is_some() {
+                        app.close_preview();
+                    } else {
+                        break;
                     }
-                    KeyCode::Down | KeyCode::Char('j') => app.next(),
-                    KeyCode::Up | KeyCode::Char('k') => app.previous(),
-                    _ => {}
                 }
+                KeyCode::Enter => app.toggle_preview(),
+                KeyCode::Char('r') => {
+                    for cam in &mut app.cameras {
+                        cam.refreshing = true;
+                    }
+                    spawn_health_check(config, &health_tx);
+                    app.health_pending = true;
+                }
+                KeyCode::Down | KeyCode::Char('j') => app.next(),
+                KeyCode::Up | KeyCode::Char('k') => app.previous(),
+                _ => {}
             }
-        } else if app.last_refresh.elapsed() >= refresh_interval {
-            poll_cameras(config, &mut app.cameras).await;
-            app.last_refresh = Instant::now();
-            app.update_counts();
+            // Force full redraw when preview changed (closed or switched camera)
+            if prev_preview != app.preview_camera {
+                terminal.clear()?;
+            }
+        }
+
+        // Auto-refresh health checks (non-blocking)
+        if !app.health_pending && app.last_refresh.elapsed() >= refresh_interval {
+            for cam in &mut app.cameras {
+                cam.refreshing = true;
+            }
+            spawn_health_check(config, &health_tx);
+            app.health_pending = true;
         }
     }
 
+    app.close_preview();
     restore_terminal();
     Ok(())
 }
