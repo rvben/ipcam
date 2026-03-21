@@ -70,6 +70,20 @@ enum Command {
         /// Stamp the camera name and timestamp onto the image using ffmpeg drawtext
         #[arg(long)]
         label: bool,
+
+        /// Display the snapshot in the terminal after saving
+        #[arg(long)]
+        preview: bool,
+    },
+
+    /// Preview a camera snapshot in the terminal
+    Preview {
+        /// Camera name from config
+        camera: String,
+
+        /// Use sub-stream (lower quality, faster)
+        #[arg(long)]
+        sub: bool,
     },
 
     /// Capture snapshots from all configured cameras in parallel
@@ -362,7 +376,15 @@ fn print_error(err: &anyhow::Error) {
         || msg.contains("network unreachable")
     {
         eprintln!();
-        eprintln!("Hint: Check that the camera is online and reachable on the network.");
+        eprintln!("Hint: Check that the camera is powered on and connected to your network.");
+    } else if msg.contains("ffmpeg")
+        && (msg.contains("no such file or directory") || msg.contains("os error 2"))
+    {
+        eprintln!();
+        eprintln!("Hint: ffmpeg is not installed. Install it with:");
+        eprintln!("  brew install ffmpeg    (macOS)");
+        eprintln!("  apt install ffmpeg     (Debian/Ubuntu)");
+        eprintln!("  dnf install ffmpeg     (Fedora)");
     } else if msg.contains("401")
         || msg.contains("403")
         || msg.contains("unauthorized")
@@ -371,9 +393,6 @@ fn print_error(err: &anyhow::Error) {
     {
         eprintln!();
         eprintln!("Hint: Check the username and password in your config file.");
-    } else if msg.contains("not found in config") {
-        eprintln!();
-        eprintln!("Hint: Run `ipcam list` to see configured cameras.");
     }
 
     if std::env::var("RUST_BACKTRACE").as_deref() == Ok("1")
@@ -414,6 +433,21 @@ async fn run() -> Result<()> {
     }
 
     config::Config::migrate_if_needed()?;
+
+    // When no config file exists, give a helpful message for commands that need cameras.
+    let needs_cameras = !matches!(
+        cli.command,
+        Command::Config { .. } | Command::Discover { .. }
+    );
+    if needs_cameras && !config::Config::config_exists()? {
+        let path = config::Config::config_path()?;
+        bail!(
+            "no cameras configured. Run `ipcam init` to set up your cameras, \
+             or create a config at {}",
+            path.display()
+        );
+    }
+
     let config = config::Config::load()?;
 
     match cli.command {
@@ -427,6 +461,7 @@ async fn run() -> Result<()> {
             output_dir,
             every,
             label,
+            preview,
         } => {
             if grid {
                 cmd_snapshot_grid(&config, output_dir, label).await
@@ -444,9 +479,10 @@ async fn run() -> Result<()> {
                         "camera name is required (or use --all to snapshot all cameras)"
                     )
                 })?;
-                cmd_snapshot(&config, &name, output, label).await
+                cmd_snapshot(&config, &name, output, label, preview).await
             }
         }
+        Command::Preview { camera, sub: _ } => cmd_preview(&config, &camera).await,
         Command::SnapshotAll { output_dir } => {
             cmd_snapshot_all(&config, output_dir, cli.json, false).await
         }
@@ -515,8 +551,8 @@ fn cmd_list(config: &config::Config, json: bool) -> Result<()> {
             println!("[]");
         } else {
             let config_path = config::Config::config_path()?;
-            println!("No cameras configured.");
-            println!("Add cameras to: {}", config_path.display());
+            println!("No cameras configured. Run `ipcam init` to discover cameras, or `ipcam add` to add one manually.");
+            println!("Config file: {}", config_path.display());
         }
         return Ok(());
     }
@@ -544,8 +580,7 @@ fn cmd_list(config: &config::Config, json: bool) -> Result<()> {
 
 async fn cmd_info(config: &config::Config, name: &str, json: bool) -> Result<()> {
     let cam_config = config
-        .find_camera(name)
-        .with_context(|| format!("camera '{}' not found in config", name))?;
+        .require_camera(name)?;
     let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
     let info = cam.info().await?;
 
@@ -608,10 +643,10 @@ async fn cmd_snapshot(
     name: &str,
     output: Option<PathBuf>,
     label: bool,
+    preview: bool,
 ) -> Result<()> {
     let cam_config = config
-        .find_camera(name)
-        .with_context(|| format!("camera '{}' not found in config", name))?;
+        .require_camera(name)?;
     let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
 
     tracing::info!("capturing snapshot from '{}'...", name);
@@ -636,6 +671,42 @@ async fn cmd_snapshot(
     }
 
     println!("Saved snapshot to {}", path.display());
+
+    if preview {
+        print_image_preview(&path)?;
+    }
+
+    Ok(())
+}
+
+fn print_image_preview(path: &std::path::Path) -> Result<()> {
+    let conf = viuer::Config {
+        absolute_offset: false,
+        ..Default::default()
+    };
+    viuer::print_from_file(path, &conf)
+        .with_context(|| format!("failed to display image preview for {}", path.display()))?;
+    Ok(())
+}
+
+async fn cmd_preview(config: &config::Config, name: &str) -> Result<()> {
+    let cam_config = config
+        .require_camera(name)?;
+    let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
+
+    tracing::info!("capturing snapshot from '{}'...", name);
+    let snapshot = cam.snapshot().await?;
+
+    let temp_path = std::env::temp_dir().join(format!(
+        "ipcam_preview_{}.{}",
+        name,
+        snapshot.format.extension()
+    ));
+
+    std::fs::write(&temp_path, &snapshot.data)?;
+    print_image_preview(&temp_path)?;
+    std::fs::remove_file(&temp_path).ok();
+
     Ok(())
 }
 
@@ -649,7 +720,7 @@ async fn cmd_snapshot_all(
         if json {
             println!("{}", serde_json::json!({"successes": [], "failures": []}));
         } else {
-            println!("No cameras configured.");
+            println!("No cameras configured. Run `ipcam init` to discover cameras, or `ipcam add` to add one manually.");
         }
         return Ok(());
     }
@@ -765,7 +836,7 @@ async fn cmd_snapshot_grid(
     label: bool,
 ) -> Result<()> {
     if config.cameras.is_empty() {
-        println!("No cameras configured.");
+        println!("No cameras configured. Run `ipcam init` to discover cameras, or `ipcam add` to add one manually.");
         return Ok(());
     }
 
@@ -976,8 +1047,7 @@ async fn cmd_stream(
     duration: u64,
 ) -> Result<()> {
     let cam_config = config
-        .find_camera(name)
-        .with_context(|| format!("camera '{}' not found in config", name))?;
+        .require_camera(name)?;
     let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
     let url = cam.rtsp_url(quality);
 
@@ -1000,8 +1070,7 @@ async fn cmd_record(
     duration: u64,
 ) -> Result<()> {
     let cam_config = config
-        .find_camera(name)
-        .with_context(|| format!("camera '{}' not found in config", name))?;
+        .require_camera(name)?;
     let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
     let url = cam.rtsp_url(StreamQuality::Main);
 
@@ -1048,8 +1117,7 @@ async fn cmd_snapshot_watch(
     interval: Duration,
 ) -> Result<()> {
     let cam_config = config
-        .find_camera(name)
-        .with_context(|| format!("camera '{}' not found in config", name))?;
+        .require_camera(name)?;
     let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
 
     std::fs::create_dir_all(&output_dir)
@@ -1108,8 +1176,7 @@ async fn cmd_timelapse(
     output_dir: Option<PathBuf>,
 ) -> Result<()> {
     let cam_config = config
-        .find_camera(name)
-        .with_context(|| format!("camera '{}' not found in config", name))?;
+        .require_camera(name)?;
     let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
 
     let (frames_dir, keep_frames) = match output_dir {
@@ -1226,8 +1293,7 @@ async fn stitch_timelapse(frames_dir: &std::path::Path, output: &std::path::Path
 
 async fn cmd_events(config: &config::Config, name: &str, watch: bool, json: bool) -> Result<()> {
     let cam_config = config
-        .find_camera(name)
-        .with_context(|| format!("camera '{}' not found in config", name))?;
+        .require_camera(name)?;
     let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
 
     if watch {
@@ -1317,8 +1383,7 @@ async fn cmd_ptz(
     speed: u8,
 ) -> Result<()> {
     let cam_config = config
-        .find_camera(name)
-        .with_context(|| format!("camera '{}' not found in config", name))?;
+        .require_camera(name)?;
     let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
 
     // Normalize speed from 1-9 range to 0.0-1.0
@@ -1360,8 +1425,7 @@ async fn cmd_status(config: &config::Config, camera: Option<&str>, json: bool) -
     let cameras_to_check: Vec<&config::CameraConfig> = match camera {
         Some(name) => {
             let cam = config
-                .find_camera(name)
-                .with_context(|| format!("camera '{}' not found in config", name))?;
+                .require_camera(name)?;
             vec![cam]
         }
         None => config.cameras.iter().collect(),
@@ -1371,7 +1435,7 @@ async fn cmd_status(config: &config::Config, camera: Option<&str>, json: bool) -
         if json {
             println!("[]");
         } else {
-            println!("No cameras configured.");
+            println!("No cameras configured. Run `ipcam init` to discover cameras, or `ipcam add` to add one manually.");
         }
         return Ok(());
     }
@@ -1470,7 +1534,7 @@ async fn cmd_watch(
     exec: Option<&str>,
 ) -> Result<()> {
     if config.cameras.is_empty() {
-        println!("No cameras configured.");
+        println!("No cameras configured. Run `ipcam init` to discover cameras, or `ipcam add` to add one manually.");
         return Ok(());
     }
 
@@ -1810,8 +1874,7 @@ async fn cmd_test(config: &config::Config, camera: Option<&str>, json: bool) -> 
     let cameras_to_test: Vec<&config::CameraConfig> = match camera {
         Some(name) => {
             let cam = config
-                .find_camera(name)
-                .with_context(|| format!("camera '{}' not found in config", name))?;
+                .require_camera(name)?;
             vec![cam]
         }
         None => config.cameras.iter().collect(),
@@ -1821,7 +1884,7 @@ async fn cmd_test(config: &config::Config, camera: Option<&str>, json: bool) -> 
         if json {
             println!("[]");
         } else {
-            println!("No cameras configured.");
+            println!("No cameras configured. Run `ipcam init` to discover cameras, or `ipcam add` to add one manually.");
         }
         return Ok(());
     }
@@ -1966,11 +2029,13 @@ fn cmd_add(
 fn cmd_remove(name: &str, yes: bool) -> Result<()> {
     let mut config = config::Config::load()?;
 
+    // Validate the camera exists (require_camera gives a good error message)
+    config.require_camera(name)?;
     let pos = config
         .cameras
         .iter()
         .position(|c| c.name == name)
-        .with_context(|| format!("camera '{}' not found in config", name))?;
+        .expect("require_camera succeeded so position must exist");
 
     let cam = &config.cameras[pos];
     println!(
@@ -2008,12 +2073,13 @@ fn cmd_remove(name: &str, yes: bool) -> Result<()> {
 fn cmd_rename(old_name: &str, new_name: &str) -> Result<()> {
     let mut config = config::Config::load()?;
 
-    // Verify old_name exists.
+    // Verify old_name exists (require_camera gives a good error message).
+    config.require_camera(old_name)?;
     let pos = config
         .cameras
         .iter()
         .position(|c| c.name == old_name)
-        .with_context(|| format!("camera '{}' not found in config", old_name))?;
+        .expect("require_camera succeeded so position must exist");
 
     // Verify new_name is not already taken.
     if config.cameras.iter().any(|c| c.name == new_name) {
@@ -2057,4 +2123,44 @@ fn cmd_rename(old_name: &str, new_name: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_duration_seconds() {
+        let d = parse_duration("30s").unwrap();
+        assert_eq!(d, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn parse_duration_minutes() {
+        let d = parse_duration("5m").unwrap();
+        assert_eq!(d, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn parse_duration_hours() {
+        let d = parse_duration("1h").unwrap();
+        assert_eq!(d, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn parse_duration_compound() {
+        let d = parse_duration("2h30m").unwrap();
+        assert_eq!(d, Duration::from_secs(2 * 3600 + 30 * 60));
+    }
+
+    #[test]
+    fn parse_duration_invalid() {
+        assert!(parse_duration("not-a-duration").is_err());
+    }
+
+    #[test]
+    fn parse_duration_error_message_contains_input() {
+        let err = parse_duration("xyz").unwrap_err();
+        assert!(err.to_string().contains("xyz"));
+    }
 }

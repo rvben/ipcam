@@ -31,6 +31,7 @@ futures = "0.3.32"
 humantime = "2"
 rand = "0.9"
 sha1 = "0.10"
+viuer = { version = "0.11", features = ["print-file"] }
 
 [profile.release]
 lto = true

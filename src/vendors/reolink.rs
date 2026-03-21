@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 
 use crate::camera::{
@@ -56,7 +56,8 @@ impl Camera for ReolinkCamera {
             "param": {}
         }]);
 
-        let resp = self.client.post(&url).json(&body).send().await?;
+        let resp = self.client.post(&url).json(&body).send().await
+            .with_context(|| format!("camera '{}' at {} is not reachable", self.name, self.host))?;
         let data: serde_json::Value = resp.json().await?;
 
         let dev_info = &data[0]["value"]["DevInfo"];
@@ -74,12 +75,14 @@ impl Camera for ReolinkCamera {
             self.host, self.username, self.password,
         );
 
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.client.get(&url).send().await
+            .with_context(|| format!("camera '{}' at {} is not reachable", self.name, self.host))?;
         if !resp.status().is_success() {
             bail!(
-                "snapshot request failed with status {} for camera '{}'",
+                "snapshot request failed with status {} for camera '{}' at {}",
                 resp.status(),
                 self.name,
+                self.host,
             );
         }
 
@@ -111,7 +114,8 @@ impl Camera for ReolinkCamera {
             "param": { "channel": 0 }
         }]);
 
-        let resp = self.client.post(&url).json(&body).send().await?;
+        let resp = self.client.post(&url).json(&body).send().await
+            .with_context(|| format!("camera '{}' at {} is not reachable", self.name, self.host))?;
         let data: serde_json::Value = resp.json().await?;
 
         let state = data[0]["value"]["state"]
@@ -234,5 +238,80 @@ impl Camera for ReolinkCamera {
             bail!("PTZ goto preset failed: {}", data);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{CameraConfig, CameraType};
+
+    fn make_reolink_config() -> CameraConfig {
+        CameraConfig {
+            name: "front-door".to_string(),
+            camera_type: CameraType::Reolink,
+            host: "192.168.1.215".to_string(),
+            rtsp_port: 554,
+            username: Some("admin".to_string()),
+            password: Some("secret".to_string()),
+            go2rtc_stream: None,
+            onvif_port: None,
+            frigate_name: None,
+        }
+    }
+
+    #[test]
+    fn rtsp_url_main_stream() {
+        let cam = ReolinkCamera::new(&make_reolink_config()).unwrap();
+        assert_eq!(
+            cam.rtsp_url(StreamQuality::Main),
+            "rtsp://admin:secret@192.168.1.215:554/h264Preview_01_main"
+        );
+    }
+
+    #[test]
+    fn rtsp_url_sub_stream() {
+        let cam = ReolinkCamera::new(&make_reolink_config()).unwrap();
+        assert_eq!(
+            cam.rtsp_url(StreamQuality::Sub),
+            "rtsp://admin:secret@192.168.1.215:554/h264Preview_01_sub"
+        );
+    }
+
+    #[test]
+    fn rtsp_url_custom_port() {
+        let mut config = make_reolink_config();
+        config.rtsp_port = 8554;
+        let cam = ReolinkCamera::new(&config).unwrap();
+        assert_eq!(
+            cam.rtsp_url(StreamQuality::Main),
+            "rtsp://admin:secret@192.168.1.215:8554/h264Preview_01_main"
+        );
+    }
+
+    #[test]
+    fn default_username_is_admin() {
+        let mut config = make_reolink_config();
+        config.username = None;
+        let cam = ReolinkCamera::new(&config).unwrap();
+        assert_eq!(
+            cam.rtsp_url(StreamQuality::Main),
+            "rtsp://admin:secret@192.168.1.215:554/h264Preview_01_main"
+        );
+    }
+
+    #[test]
+    fn api_url_format() {
+        let cam = ReolinkCamera::new(&make_reolink_config()).unwrap();
+        assert_eq!(
+            cam.api_url("GetDevInfo"),
+            "https://192.168.1.215/api.cgi?cmd=GetDevInfo&user=admin&password=secret"
+        );
+    }
+
+    #[test]
+    fn api_url_uses_https() {
+        let cam = ReolinkCamera::new(&make_reolink_config()).unwrap();
+        assert!(cam.api_url("Snap").starts_with("https://"));
     }
 }

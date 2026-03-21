@@ -94,7 +94,10 @@ impl TapoCamera {
             .body(envelope)
             .send()
             .await
-            .context("failed to connect to ONVIF PTZ service")?;
+            .with_context(|| format!(
+                "camera '{}' at {} is not reachable (ONVIF PTZ service)",
+                self.name, self.host
+            ))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -159,8 +162,9 @@ impl Camera for TapoCamera {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!(
-                "ffmpeg snapshot failed for camera '{}': {}",
+                "ffmpeg snapshot failed for camera '{}' at {}: {}",
                 self.name,
+                self.host,
                 stderr.lines().last().unwrap_or("unknown error")
             );
         }
@@ -241,5 +245,115 @@ impl Camera for TapoCamera {
 </tptz:GotoPreset>"#,
         );
         self.send_ptz_soap(&body).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{CameraConfig, CameraType, Go2rtcConfig};
+
+    fn make_tapo_config() -> CameraConfig {
+        CameraConfig {
+            name: "kids-room".to_string(),
+            camera_type: CameraType::Tapo,
+            host: "192.168.1.97".to_string(),
+            rtsp_port: 554,
+            username: Some("user".to_string()),
+            password: Some("pass".to_string()),
+            go2rtc_stream: None,
+            onvif_port: None,
+            frigate_name: None,
+        }
+    }
+
+    fn make_go2rtc() -> Go2rtcConfig {
+        Go2rtcConfig {
+            host: "192.168.1.180".to_string(),
+            port: 8554,
+        }
+    }
+
+    #[test]
+    fn direct_rtsp_url_main() {
+        let config = make_tapo_config();
+        let cam = TapoCamera::new(&config, None).unwrap();
+        assert_eq!(
+            cam.effective_rtsp_url(StreamQuality::Main),
+            "rtsp://user:pass@192.168.1.97:554/stream1"
+        );
+    }
+
+    #[test]
+    fn direct_rtsp_url_sub() {
+        let config = make_tapo_config();
+        let cam = TapoCamera::new(&config, None).unwrap();
+        assert_eq!(
+            cam.effective_rtsp_url(StreamQuality::Sub),
+            "rtsp://user:pass@192.168.1.97:554/stream2"
+        );
+    }
+
+    #[test]
+    fn go2rtc_restream_url_main() {
+        let mut config = make_tapo_config();
+        config.go2rtc_stream = Some("kids_room".to_string());
+        let go2rtc = make_go2rtc();
+        let cam = TapoCamera::new(&config, Some(&go2rtc)).unwrap();
+        assert_eq!(
+            cam.effective_rtsp_url(StreamQuality::Main),
+            "rtsp://192.168.1.180:8554/kids_room"
+        );
+    }
+
+    #[test]
+    fn go2rtc_restream_url_sub() {
+        let mut config = make_tapo_config();
+        config.go2rtc_stream = Some("kids_room".to_string());
+        let go2rtc = make_go2rtc();
+        let cam = TapoCamera::new(&config, Some(&go2rtc)).unwrap();
+        assert_eq!(
+            cam.effective_rtsp_url(StreamQuality::Sub),
+            "rtsp://192.168.1.180:8554/kids_room_sub"
+        );
+    }
+
+    #[test]
+    fn no_go2rtc_stream_ignores_go2rtc_config() {
+        let config = make_tapo_config();
+        let go2rtc = make_go2rtc();
+        // go2rtc config provided but no go2rtc_stream on camera => direct RTSP
+        let cam = TapoCamera::new(&config, Some(&go2rtc)).unwrap();
+        assert_eq!(
+            cam.effective_rtsp_url(StreamQuality::Main),
+            "rtsp://user:pass@192.168.1.97:554/stream1"
+        );
+    }
+
+    #[test]
+    fn ptz_url_uses_onvif_port() {
+        let config = make_tapo_config();
+        let cam = TapoCamera::new(&config, None).unwrap();
+        assert_eq!(cam.ptz_url(), "http://192.168.1.97:2020/onvif/ptz_service");
+    }
+
+    #[test]
+    fn ptz_url_custom_onvif_port() {
+        let mut config = make_tapo_config();
+        config.onvif_port = Some(3000);
+        let cam = TapoCamera::new(&config, None).unwrap();
+        assert_eq!(cam.ptz_url(), "http://192.168.1.97:3000/onvif/ptz_service");
+    }
+
+    #[test]
+    fn empty_credentials_default() {
+        let mut config = make_tapo_config();
+        config.username = None;
+        config.password = None;
+        let cam = TapoCamera::new(&config, None).unwrap();
+        assert_eq!(
+            cam.effective_rtsp_url(StreamQuality::Main),
+            "rtsp://:@192.168.1.97:554/stream1"
+        );
     }
 }
