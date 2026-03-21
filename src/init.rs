@@ -278,7 +278,7 @@ pub async fn run_init(auto: bool) -> Result<()> {
                     return Ok(());
                 }
                 // Load existing config so we can append to it.
-                let existing = Config::load()?;
+                let existing = Config::load(None)?;
                 existing_cameras = existing.cameras;
                 existing_go2rtc = existing.go2rtc;
                 existing_frigate = existing.frigate;
@@ -289,7 +289,7 @@ pub async fn run_init(auto: bool) -> Result<()> {
     // Run ONVIF discovery.
     println!();
     println!("Scanning network for cameras (this may take a few seconds)...");
-    let discovered = discover_cameras(Duration::from_secs(5)).await?;
+    let discovered = discover_cameras(Duration::from_secs(5), None).await?;
 
     if discovered.is_empty() {
         println!("No cameras found on the network.");

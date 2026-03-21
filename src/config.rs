@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -111,8 +111,11 @@ fn default_rtsp_port() -> u16 {
 }
 
 impl Config {
-    pub fn load() -> Result<Self> {
-        let path = Self::config_path()?;
+    pub fn load(custom_path: Option<&Path>) -> Result<Self> {
+        let path = match custom_path {
+            Some(p) => p.to_path_buf(),
+            None => Self::config_path()?,
+        };
         if !path.exists() {
             return Ok(Self {
                 go2rtc: None,

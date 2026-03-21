@@ -3,9 +3,10 @@ mod config;
 mod discovery;
 mod frigate;
 mod init;
+mod tui;
 mod vendors;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -253,6 +254,13 @@ enum Command {
         camera: Option<String>,
     },
 
+    /// Live TUI dashboard showing all camera statuses
+    Dashboard {
+        /// Refresh interval in seconds
+        #[arg(short, long, default_value = "5")]
+        interval: u64,
+    },
+
     /// Rename a camera in the config file
     Rename {
         /// Current camera name
@@ -310,6 +318,9 @@ enum PtzAction {
     Down,
     Stop,
     Preset,
+    ZoomIn,
+    ZoomOut,
+    Home,
 }
 
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -491,7 +502,7 @@ async fn run_with(cli: Cli) -> Result<()> {
         );
     }
 
-    let config = config::Config::load()?;
+    let config = config::Config::load(cli.config.as_deref())?;
 
     match cli.command {
         Command::List => cmd_list(&config, cli.json),
@@ -559,9 +570,9 @@ async fn run_with(cli: Cli) -> Result<()> {
         Command::Config { action } => match action.unwrap_or(ConfigAction::Path) {
             ConfigAction::Path => cmd_config_path(cli.json),
             ConfigAction::Edit => cmd_config_edit(),
-            ConfigAction::Show => cmd_config_show(cli.json),
+            ConfigAction::Show => cmd_config_show(cli.json, cli.config.as_deref()),
         },
-        Command::Discover { timeout } => cmd_discover(timeout, cli.json).await,
+        Command::Discover { timeout } => cmd_discover(timeout, cli.json, &config).await,
         Command::Events { camera, watch } => cmd_events(&config, &camera, watch, cli.json).await,
         Command::Status { camera } => cmd_status(&config, camera.as_deref(), cli.json).await,
         Command::Frigate { action } => cmd_frigate(&config, action, cli.json).await,
@@ -576,7 +587,8 @@ async fn run_with(cli: Cli) -> Result<()> {
             cmd_watch(&config, interval, exec.as_deref()).await
         }
         Command::Test { camera } => cmd_test(&config, camera.as_deref(), cli.json).await,
-        Command::Rename { old_name, new_name } => cmd_rename(&old_name, &new_name),
+        Command::Dashboard { interval } => tui::run_dashboard(&config, interval).await,
+        Command::Rename { old_name, new_name } => cmd_rename(&old_name, &new_name, cli.config.as_deref()),
         Command::Add {
             host,
             name,
@@ -585,8 +597,8 @@ async fn run_with(cli: Cli) -> Result<()> {
             password,
             rtsp_port,
             go2rtc_stream,
-        } => cmd_add(&host, name.as_deref(), r#type, &username, password.as_deref(), rtsp_port, go2rtc_stream.as_deref()),
-        Command::Remove { name, yes } => cmd_remove(&name, yes),
+        } => cmd_add(&host, name.as_deref(), r#type, &username, password.as_deref(), rtsp_port, go2rtc_stream.as_deref(), cli.config.as_deref()),
+        Command::Remove { name, yes } => cmd_remove(&name, yes, cli.config.as_deref()),
         Command::Completions { .. } | Command::Init { .. } => {
             unreachable!("handled before config load")
         }
@@ -1490,8 +1502,8 @@ fn print_motion_status(name: &str, status: &MotionStatus, json: bool) {
     }
 }
 
-async fn cmd_discover(timeout: u64, json: bool) -> Result<()> {
-    let cameras = discovery::discover_cameras(Duration::from_secs(timeout)).await?;
+async fn cmd_discover(timeout: u64, json: bool, config: &config::Config) -> Result<()> {
+    let cameras = discovery::discover_cameras(Duration::from_secs(timeout), Some(config)).await?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&cameras)?);
@@ -1564,6 +1576,18 @@ async fn cmd_ptz(
                 .ok_or_else(|| anyhow::anyhow!("preset number is required for 'preset' action"))?;
             cam.ptz_goto_preset(num).await?;
             println!("Moving '{}' to preset {}", name, num);
+        }
+        PtzAction::ZoomIn => {
+            cam.ptz_zoom(normalized_speed).await?;
+            println!("Zooming in on '{}' (speed {})", name, speed);
+        }
+        PtzAction::ZoomOut => {
+            cam.ptz_zoom(-normalized_speed).await?;
+            println!("Zooming out on '{}' (speed {})", name, speed);
+        }
+        PtzAction::Home => {
+            cam.ptz_home().await?;
+            println!("Moving '{}' to home position", name);
         }
     }
 
@@ -1896,8 +1920,8 @@ fn cmd_config_edit() -> Result<()> {
     Ok(())
 }
 
-fn cmd_config_show(json: bool) -> Result<()> {
-    let mut cfg = config::Config::load()?;
+fn cmd_config_show(json: bool, config_path: Option<&Path>) -> Result<()> {
+    let mut cfg = config::Config::load(config_path)?;
 
     // Mask passwords in all camera entries.
     for cam in &mut cfg.cameras {
@@ -2119,6 +2143,7 @@ async fn cmd_test(config: &config::Config, camera: Option<&str>, json: bool) -> 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_add(
     host: &str,
     name: Option<&str>,
@@ -2127,8 +2152,9 @@ fn cmd_add(
     password: Option<&str>,
     rtsp_port: u16,
     go2rtc_stream: Option<&str>,
+    config_path: Option<&Path>,
 ) -> Result<()> {
-    let mut config = config::Config::load()?;
+    let mut config = config::Config::load(config_path)?;
 
     // Auto-generate name from last octet if not provided.
     let resolved_name = match name {
@@ -2188,8 +2214,8 @@ fn cmd_add(
     Ok(())
 }
 
-fn cmd_remove(name: &str, yes: bool) -> Result<()> {
-    let mut config = config::Config::load()?;
+fn cmd_remove(name: &str, yes: bool, config_path: Option<&Path>) -> Result<()> {
+    let mut config = config::Config::load(config_path)?;
 
     // Validate the camera exists (require_camera gives a good error message)
     config.require_camera(name)?;
@@ -2232,8 +2258,8 @@ fn cmd_remove(name: &str, yes: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_rename(old_name: &str, new_name: &str) -> Result<()> {
-    let mut config = config::Config::load()?;
+fn cmd_rename(old_name: &str, new_name: &str, config_path: Option<&Path>) -> Result<()> {
+    let mut config = config::Config::load(config_path)?;
 
     // Verify old_name exists (require_camera gives a good error message).
     config.require_camera(old_name)?;
