@@ -76,6 +76,24 @@ enum Command {
         preview: bool,
     },
 
+    /// Open a live RTSP stream from a camera
+    Live {
+        /// Camera name from config
+        camera: String,
+
+        /// Stream quality
+        #[arg(short, long, default_value = "main")]
+        quality: StreamQuality,
+
+        /// Player to use: ffplay, mpv, vlc (default: auto-detect)
+        #[arg(short, long)]
+        player: Option<String>,
+
+        /// Render video inline in the terminal (requires mpv with sixel/kitty support)
+        #[arg(long)]
+        inline: bool,
+    },
+
     /// Preview a camera snapshot in the terminal
     Preview {
         /// Camera name from config
@@ -482,6 +500,12 @@ async fn run() -> Result<()> {
                 cmd_snapshot(&config, &name, output, label, preview).await
             }
         }
+        Command::Live {
+            camera,
+            quality,
+            player,
+            inline,
+        } => cmd_live(&config, &camera, quality, player, inline).await,
         Command::Preview { camera, sub: _ } => cmd_preview(&config, &camera).await,
         Command::SnapshotAll { output_dir } => {
             cmd_snapshot_all(&config, output_dir, cli.json, false).await
@@ -708,6 +732,106 @@ async fn cmd_preview(config: &config::Config, name: &str) -> Result<()> {
     std::fs::remove_file(&temp_path).ok();
 
     Ok(())
+}
+
+async fn cmd_live(
+    config: &config::Config,
+    name: &str,
+    quality: StreamQuality,
+    player: Option<String>,
+    inline: bool,
+) -> Result<()> {
+    let cam_config = config.require_camera(name)?;
+    let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
+    let url = cam.rtsp_url(quality);
+
+    let (cmd, args) = if inline {
+        detect_inline_player(&url)?
+    } else if let Some(ref p) = player {
+        player_args(p, &url)?
+    } else {
+        detect_player(&url)?
+    };
+
+    println!("Opening live stream from '{}' with {}...", name, cmd);
+    let status = tokio::process::Command::new(&cmd)
+        .args(&args)
+        .status()
+        .await
+        .with_context(|| format!("{} not found. Install it or specify a player with --player", cmd))?;
+
+    if !status.success() {
+        bail!("{} exited with status {}", cmd, status);
+    }
+    Ok(())
+}
+
+fn detect_player(url: &str) -> Result<(String, Vec<String>)> {
+    for player in &["ffplay", "mpv", "vlc"] {
+        if which(player) {
+            return player_args(player, url);
+        }
+    }
+    bail!(
+        "no video player found. Install one of: ffplay (comes with ffmpeg), mpv, or vlc"
+    );
+}
+
+fn detect_inline_player(url: &str) -> Result<(String, Vec<String>)> {
+    if which("mpv") {
+        // Try sixel first (widely supported), fall back to kitty, then tct (block chars)
+        let vo = if std::env::var("TERM_PROGRAM").as_deref() == Ok("iTerm.app") {
+            "sixel"
+        } else if std::env::var("TERM").as_deref() == Ok("xterm-kitty") {
+            "kitty"
+        } else {
+            "tct"
+        };
+        Ok((
+            "mpv".to_string(),
+            vec![
+                format!("--vo={}", vo),
+                "--profile=low-latency".to_string(),
+                url.to_string(),
+            ],
+        ))
+    } else {
+        bail!("--inline requires mpv. Install it with: brew install mpv (macOS) or apt install mpv (Linux)");
+    }
+}
+
+fn player_args(player: &str, url: &str) -> Result<(String, Vec<String>)> {
+    let args = match player {
+        "ffplay" => vec![
+            "-rtsp_transport".to_string(),
+            "tcp".to_string(),
+            "-loglevel".to_string(),
+            "error".to_string(),
+            "-window_title".to_string(),
+            "ipcam".to_string(),
+            url.to_string(),
+        ],
+        "mpv" => vec![
+            "--profile=low-latency".to_string(),
+            url.to_string(),
+        ],
+        "vlc" => vec![
+            "--intf".to_string(),
+            "dummy".to_string(),
+            url.to_string(),
+        ],
+        _ => vec![url.to_string()],
+    };
+    Ok((player.to_string(), args))
+}
+
+fn which(cmd: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(cmd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 async fn cmd_snapshot_all(
