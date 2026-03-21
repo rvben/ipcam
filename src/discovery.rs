@@ -3,9 +3,13 @@ use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use base64::Engine;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
+
+use crate::config::Config;
 
 const WS_DISCOVERY_ADDR: &str = "239.255.255.250:3702";
 const LOCAL_BIND_ADDR: &str = "0.0.0.0:0";
@@ -93,6 +97,77 @@ fn extract_types(xml: &str) -> Vec<String> {
         .into_iter()
         .flat_map(|s| s.split_whitespace().map(str::to_string).collect::<Vec<_>>())
         .collect()
+}
+
+/// Parse ONVIF scope URIs from a ProbeMatch response to extract manufacturer and model.
+///
+/// Cameras advertise metadata in their Scopes element using URIs like:
+/// - `onvif://www.onvif.org/name/CameraName`
+/// - `onvif://www.onvif.org/hardware/ModelName`
+/// - `onvif://www.onvif.org/manufacturer/Vendor`
+/// - `onvif://www.onvif.org/Profile/Streaming`
+///
+/// Returns (manufacturer, model) where either may be None.
+fn extract_scopes_info(xml: &str) -> (Option<String>, Option<String>) {
+    let scopes = extract_xml_elements(xml, "Scopes");
+    let mut manufacturer = None;
+    let mut model = None;
+
+    for scope_line in &scopes {
+        for uri in scope_line.split_whitespace() {
+            // Decode percent-encoded characters (e.g. %20 -> space)
+            let decoded = percent_decode(uri);
+
+            if let Some(value) = decoded.strip_prefix("onvif://www.onvif.org/name/") {
+                let value = value.trim();
+                if !value.is_empty() && manufacturer.is_none() {
+                    manufacturer = Some(value.to_string());
+                }
+            } else if let Some(value) = decoded.strip_prefix("onvif://www.onvif.org/manufacturer/")
+            {
+                let value = value.trim();
+                if !value.is_empty() {
+                    // Prefer explicit manufacturer over name
+                    manufacturer = Some(value.to_string());
+                }
+            } else if let Some(value) = decoded.strip_prefix("onvif://www.onvif.org/hardware/") {
+                let value = value.trim();
+                if !value.is_empty() && model.is_none() {
+                    model = Some(value.to_string());
+                }
+            }
+        }
+    }
+
+    (manufacturer, model)
+}
+
+/// Simple percent-decoding for ONVIF scope URIs.
+fn percent_decode(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let hi = chars.next();
+            let lo = chars.next();
+            if let (Some(h), Some(l)) = (hi, lo) {
+                let hex = [h, l];
+                if let Ok(s) = std::str::from_utf8(&hex)
+                    && let Ok(byte) = u8::from_str_radix(s, 16)
+                {
+                    result.push(byte as char);
+                    continue;
+                }
+                // Failed to decode, emit as-is
+                result.push('%');
+                result.push(h as char);
+                result.push(l as char);
+            }
+        } else {
+            result.push(b as char);
+        }
+    }
+    result
 }
 
 /// Parse the IP address out of an ONVIF service URL.
@@ -184,10 +259,20 @@ fn send_probe(timeout: Duration) -> Result<Vec<String>> {
             )
         };
         if result != 0 {
-            tracing::debug!("set multicast IF {}: errno {}", ip, std::io::Error::last_os_error());
+            tracing::debug!(
+                "set multicast IF {}: errno {}",
+                ip,
+                std::io::Error::last_os_error()
+            );
             continue;
         }
-        tracing::debug!("sending probe via {}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]);
+        tracing::debug!(
+            "sending probe via {}.{}.{}.{}",
+            octets[0],
+            octets[1],
+            octets[2],
+            octets[3]
+        );
         if let Err(e) = socket.send_to(probe.as_bytes(), dest) {
             tracing::debug!("send probe via {}: {}", ip, e);
         }
@@ -220,46 +305,69 @@ fn send_probe(timeout: Duration) -> Result<Vec<String>> {
     Ok(responses)
 }
 
-/// Build the SOAP envelope for ONVIF GetDeviceInformation.
-fn get_device_info_request(username: Option<&str>, password: Option<&str>) -> String {
-    let security_header = match (username, password) {
-        (Some(u), Some(p)) => format!(
-            r#"<s:Header>
-    <Security xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
-      <UsernameToken>
-        <Username>{u}</Username>
-        <Password>{p}</Password>
-      </UsernameToken>
-    </Security>
-  </s:Header>"#
-        ),
-        _ => String::new(),
-    };
+/// Build a SOAP envelope with WS-Security Password Digest authentication.
+///
+/// Uses the same digest scheme as the ONVIF spec:
+/// Digest = Base64(SHA1(nonce + created + password))
+fn get_device_info_request_digest(username: &str, password: &str) -> String {
+    let nonce_bytes: [u8; 16] = rand::random();
+    let nonce_b64 = base64::engine::general_purpose::STANDARD.encode(nonce_bytes);
+    let created = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+
+    let mut hasher = Sha1::new();
+    hasher.update(nonce_bytes);
+    hasher.update(created.as_bytes());
+    hasher.update(password.as_bytes());
+    let digest = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+            xmlns:tds="http://www.onvif.org/ver10/device/wsdl"
+            xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
+            xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
+  <s:Header>
+    <wsse:Security>
+      <wsse:UsernameToken>
+        <wsse:Username>{username}</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{digest}</wsse:Password>
+        <wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">{nonce}</wsse:Nonce>
+        <wsu:Created>{created}</wsu:Created>
+      </wsse:UsernameToken>
+    </wsse:Security>
+  </s:Header>
+  <s:Body>
+    <tds:GetDeviceInformation/>
+  </s:Body>
+</s:Envelope>"#,
+        nonce = nonce_b64,
+    )
+}
+
+/// Build the SOAP envelope for an unauthenticated ONVIF GetDeviceInformation request.
+fn get_device_info_request_unauth() -> String {
+    r#"<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
             xmlns:tds="http://www.onvif.org/ver10/device/wsdl">
-  {security_header}
   <s:Body>
     <tds:GetDeviceInformation/>
   </s:Body>
 </s:Envelope>"#
-    )
+        .to_string()
 }
 
-/// Call ONVIF GetDeviceInformation on a device and return (manufacturer, model).
-async fn get_device_info(client: &reqwest::Client, onvif_url: &str) -> Option<(String, String)> {
-    let body = get_device_info_request(None, None);
-
+/// Send a GetDeviceInformation SOAP request and parse (manufacturer, model) from the response.
+async fn send_device_info_request(
+    client: &reqwest::Client,
+    onvif_url: &str,
+    body: &str,
+) -> Option<(String, String)> {
     let resp = client
         .post(onvif_url)
         .header("Content-Type", "application/soap+xml; charset=utf-8")
-        .header(
-            "SOAPAction",
-            "http://www.onvif.org/ver10/device/wsdl/GetDeviceInformation",
-        )
-        .body(body)
+        .body(body.to_string())
         .timeout(Duration::from_secs(3))
         .send()
         .await
@@ -267,13 +375,37 @@ async fn get_device_info(client: &reqwest::Client, onvif_url: &str) -> Option<(S
 
     let xml = resp.text().await.ok()?;
 
-    let manufacturers = extract_xml_elements(&xml, "Manufacturer");
-    let models = extract_xml_elements(&xml, "Model");
-
-    let manufacturer = manufacturers.into_iter().next()?;
-    let model = models.into_iter().next()?;
+    let manufacturer = extract_xml_elements(&xml, "Manufacturer")
+        .into_iter()
+        .next()?;
+    let model = extract_xml_elements(&xml, "Model").into_iter().next()?;
 
     Some((manufacturer, model))
+}
+
+/// Call ONVIF GetDeviceInformation on a device and return (manufacturer, model).
+///
+/// Tries unauthenticated first. If that fails and credentials are provided,
+/// retries with WS-Security Password Digest authentication.
+async fn get_device_info(
+    client: &reqwest::Client,
+    onvif_url: &str,
+    credentials: Option<(&str, &str)>,
+) -> Option<(String, String)> {
+    // Try unauthenticated first
+    let unauth_body = get_device_info_request_unauth();
+    if let Some(result) = send_device_info_request(client, onvif_url, &unauth_body).await {
+        return Some(result);
+    }
+
+    // If we have credentials, retry with digest auth
+    let (username, password) = credentials?;
+    tracing::debug!(
+        "unauthenticated GetDeviceInformation failed for {}, retrying with digest auth",
+        onvif_url
+    );
+    let digest_body = get_device_info_request_digest(username, password);
+    send_device_info_request(client, onvif_url, &digest_body).await
 }
 
 /// Discover cameras on the local network via WS-Discovery.
@@ -281,7 +413,15 @@ async fn get_device_info(client: &reqwest::Client, onvif_url: &str) -> Option<(S
 /// Sends a UDP multicast Probe and waits for ProbeMatch responses for `timeout`
 /// duration. For each unique ONVIF endpoint found, attempts to fetch basic
 /// device information.
-pub async fn discover_cameras(timeout: Duration) -> Result<Vec<DiscoveredCamera>> {
+///
+/// When `config` is provided, credentials from matching camera entries are used
+/// for authenticated GetDeviceInformation requests when unauthenticated requests
+/// fail. Manufacturer and model are also extracted from WS-Discovery Scopes
+/// as a fallback.
+pub async fn discover_cameras(
+    timeout: Duration,
+    config: Option<&Config>,
+) -> Result<Vec<DiscoveredCamera>> {
     tracing::info!(
         "sending WS-Discovery probe (timeout: {}s)...",
         timeout.as_secs()
@@ -301,6 +441,7 @@ pub async fn discover_cameras(timeout: Duration) -> Result<Vec<DiscoveredCamera>
     for xml in &responses {
         let xaddrs = extract_xaddrs(xml);
         let types = extract_types(xml);
+        let (scope_manufacturer, scope_model) = extract_scopes_info(xml);
 
         for xaddr in xaddrs {
             // Normalise to the device service endpoint.
@@ -316,13 +457,28 @@ pub async fn discover_cameras(timeout: Duration) -> Result<Vec<DiscoveredCamera>
 
             let address = address_from_url(&xaddr);
 
-            let (manufacturer, model) = match get_device_info(&client, &onvif_url).await {
-                Some((mfr, mdl)) => (Some(mfr), Some(mdl)),
-                None => {
-                    tracing::debug!("no device info from {}", onvif_url);
-                    (None, None)
-                }
-            };
+            // Look up credentials from config if available
+            let credentials = config
+                .and_then(|cfg| {
+                    cfg.cameras
+                        .iter()
+                        .find(|c| c.host == address)
+                })
+                .and_then(|cam| {
+                    match (cam.username.as_deref(), cam.password.as_deref()) {
+                        (Some(u), Some(p)) => Some((u, p)),
+                        _ => None,
+                    }
+                });
+
+            let (manufacturer, model) =
+                match get_device_info(&client, &onvif_url, credentials).await {
+                    Some((mfr, mdl)) => (Some(mfr), Some(mdl)),
+                    None => {
+                        tracing::debug!("no device info from {}, using scopes", onvif_url);
+                        (scope_manufacturer.clone(), scope_model.clone())
+                    }
+                };
 
             cameras.push(DiscoveredCamera {
                 address,
@@ -335,4 +491,99 @@ pub async fn discover_cameras(timeout: Duration) -> Result<Vec<DiscoveredCamera>
     }
 
     Ok(cameras)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_scopes_manufacturer_and_model() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+            xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery">
+  <s:Body>
+    <d:ProbeMatches>
+      <d:ProbeMatch>
+        <d:Scopes>onvif://www.onvif.org/name/Reolink onvif://www.onvif.org/hardware/D340W onvif://www.onvif.org/Profile/Streaming</d:Scopes>
+      </d:ProbeMatch>
+    </d:ProbeMatches>
+  </s:Body>
+</s:Envelope>"#;
+        let (mfr, model) = extract_scopes_info(xml);
+        assert_eq!(mfr.as_deref(), Some("Reolink"));
+        assert_eq!(model.as_deref(), Some("D340W"));
+    }
+
+    #[test]
+    fn extract_scopes_manufacturer_uri_preferred() {
+        let xml = r#"<Envelope><Body><ProbeMatches><ProbeMatch>
+        <Scopes>onvif://www.onvif.org/name/GenericCam onvif://www.onvif.org/manufacturer/ACME onvif://www.onvif.org/hardware/Model99</Scopes>
+        </ProbeMatch></ProbeMatches></Body></Envelope>"#;
+        let (mfr, model) = extract_scopes_info(xml);
+        // manufacturer/ URI takes precedence over name/
+        assert_eq!(mfr.as_deref(), Some("ACME"));
+        assert_eq!(model.as_deref(), Some("Model99"));
+    }
+
+    #[test]
+    fn extract_scopes_with_percent_encoding() {
+        let xml = r#"<Envelope><Body><ProbeMatches><ProbeMatch>
+        <Scopes>onvif://www.onvif.org/name/TP-Link%20Camera onvif://www.onvif.org/hardware/Tapo%20C200</Scopes>
+        </ProbeMatch></ProbeMatches></Body></Envelope>"#;
+        let (mfr, model) = extract_scopes_info(xml);
+        assert_eq!(mfr.as_deref(), Some("TP-Link Camera"));
+        assert_eq!(model.as_deref(), Some("Tapo C200"));
+    }
+
+    #[test]
+    fn extract_scopes_empty() {
+        let xml = r#"<Envelope><Body><ProbeMatches><ProbeMatch>
+        <Scopes>onvif://www.onvif.org/Profile/Streaming</Scopes>
+        </ProbeMatch></ProbeMatches></Body></Envelope>"#;
+        let (mfr, model) = extract_scopes_info(xml);
+        assert!(mfr.is_none());
+        assert!(model.is_none());
+    }
+
+    #[test]
+    fn extract_scopes_no_scopes_element() {
+        let xml = r#"<Envelope><Body><ProbeMatches><ProbeMatch>
+        <XAddrs>http://192.168.1.1/onvif/device_service</XAddrs>
+        </ProbeMatch></ProbeMatches></Body></Envelope>"#;
+        let (mfr, model) = extract_scopes_info(xml);
+        assert!(mfr.is_none());
+        assert!(model.is_none());
+    }
+
+    #[test]
+    fn percent_decode_basic() {
+        assert_eq!(percent_decode("hello%20world"), "hello world");
+        assert_eq!(percent_decode("no%20encoding%21"), "no encoding!");
+        assert_eq!(percent_decode("plain"), "plain");
+    }
+
+    #[test]
+    fn percent_decode_invalid_sequence() {
+        // Invalid hex should be passed through
+        assert_eq!(percent_decode("bad%ZZvalue"), "bad%ZZvalue");
+    }
+
+    #[test]
+    fn digest_auth_request_contains_security_header() {
+        let body = get_device_info_request_digest("admin", "password123");
+        assert!(body.contains("<wsse:Username>admin</wsse:Username>"));
+        assert!(body.contains("PasswordDigest"));
+        assert!(body.contains("<wsu:Created>"));
+        assert!(body.contains("<wsse:Nonce"));
+        assert!(body.contains("GetDeviceInformation"));
+    }
+
+    #[test]
+    fn unauth_request_has_no_security_header() {
+        let body = get_device_info_request_unauth();
+        assert!(!body.contains("wsse"));
+        assert!(!body.contains("Security"));
+        assert!(body.contains("GetDeviceInformation"));
+    }
 }
