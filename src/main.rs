@@ -27,6 +27,10 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Suppress informational output
+    #[arg(long, short, global = true)]
+    quiet: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -361,25 +365,39 @@ enum ConfigAction {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("ipcam=info".parse().unwrap()),
-        )
-        .init();
+    // Pre-parse to check for --json/--quiet before full CLI parsing,
+    // so we can suppress tracing output early.
+    let cli = Cli::parse();
+    let suppress = cli.json || cli.quiet;
 
-    if let Err(err) = run().await {
+    if suppress {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive("ipcam=warn".parse().unwrap()),
+            )
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive("ipcam=info".parse().unwrap()),
+            )
+            .init();
+    }
+
+    if let Err(err) = run_with(cli).await {
         print_error(&err);
         std::process::exit(1);
     }
 }
 
 fn print_error(err: &anyhow::Error) {
-    eprintln!("Error: {err}");
+    eprintln!("Error: {}", redact_url(&err.to_string()));
 
     let mut source = err.source();
     while let Some(cause) = source {
-        eprintln!("  caused by: {cause}");
+        eprintln!("  caused by: {}", redact_url(&cause.to_string()));
         source = cause.source();
     }
 
@@ -421,6 +439,19 @@ fn print_error(err: &anyhow::Error) {
     }
 }
 
+/// Redact credentials from an RTSP URL for safe logging/display.
+/// Turns `rtsp://user:pass@host/path` into `rtsp://****:****@host/path`.
+fn redact_url(url: &str) -> String {
+    if let Some(at_pos) = url.find('@')
+        && let Some(scheme_end) = url.find("://")
+    {
+        let prefix = &url[..scheme_end + 3];
+        let after_at = &url[at_pos..];
+        return format!("{}****:****{}", prefix, after_at);
+    }
+    url.to_string()
+}
+
 /// Parse a human-readable duration string like "30s", "5m", "1h", "2h30m".
 fn parse_duration(s: &str) -> Result<Duration> {
     humantime::parse_duration(s).with_context(|| {
@@ -431,9 +462,7 @@ fn parse_duration(s: &str) -> Result<Duration> {
     })
 }
 
-async fn run() -> Result<()> {
-    let cli = Cli::parse();
-
+async fn run_with(cli: Cli) -> Result<()> {
     if let Command::Completions { shell } = cli.command {
         let mut cmd = Cli::command();
         let bin_name = cmd.get_name().to_string();
@@ -493,7 +522,7 @@ async fn run() -> Result<()> {
                         "camera name is required (or use --all to snapshot all cameras)"
                     )
                 })?;
-                cmd_snapshot(&config, &name, output, label, preview).await
+                cmd_snapshot(&config, &name, output, label, preview, cli.json).await
             }
         }
         Command::Live {
@@ -510,12 +539,12 @@ async fn run() -> Result<()> {
             quality,
             output,
             duration,
-        } => cmd_stream(&config, &camera, quality, output, duration).await,
+        } => cmd_stream(&config, &camera, quality, output, duration, cli.json).await,
         Command::Record {
             camera,
             output,
             duration,
-        } => cmd_record(&config, &camera, output, duration).await,
+        } => cmd_record(&config, &camera, output, duration, cli.json).await,
         Command::Timelapse {
             camera,
             interval,
@@ -528,9 +557,9 @@ async fn run() -> Result<()> {
             cmd_timelapse(&config, &camera, interval, duration, output, output_dir).await
         }
         Command::Config { action } => match action.unwrap_or(ConfigAction::Path) {
-            ConfigAction::Path => cmd_config_path(),
+            ConfigAction::Path => cmd_config_path(cli.json),
             ConfigAction::Edit => cmd_config_edit(),
-            ConfigAction::Show => cmd_config_show(),
+            ConfigAction::Show => cmd_config_show(cli.json),
         },
         Command::Discover { timeout } => cmd_discover(timeout, cli.json).await,
         Command::Events { camera, watch } => cmd_events(&config, &camera, watch, cli.json).await,
@@ -663,6 +692,7 @@ async fn cmd_snapshot(
     output: Option<PathBuf>,
     label: bool,
     preview: bool,
+    json: bool,
 ) -> Result<()> {
     let cam_config = config
         .require_camera(name)?;
@@ -689,7 +719,16 @@ async fn cmd_snapshot(
         apply_label(&path, name, &display_ts).await?;
     }
 
-    println!("Saved snapshot to {}", path.display());
+    if json {
+        println!("{}", serde_json::json!({
+            "camera": name,
+            "file": path.display().to_string(),
+            "size_bytes": snapshot.data.len(),
+            "timestamp": snapshot.timestamp.to_rfc3339(),
+        }));
+    } else {
+        println!("Saved snapshot to {}", path.display());
+    }
 
     if preview {
         print_image_preview(&path)?;
@@ -740,7 +779,7 @@ async fn cmd_live(
     let url = cam.rtsp_url(quality);
 
     if window {
-        println!("Opening live stream from '{}' in ffplay...", name);
+        eprintln!("Opening live stream from '{}' in ffplay...", name);
         let status = tokio::process::Command::new("ffplay")
             .args([
                 "-rtsp_transport", "tcp",
@@ -758,7 +797,7 @@ async fn cmd_live(
     }
 
     // Inline mode: grab frames via ffmpeg and display with viuer
-    println!("Live view of '{}' (press Ctrl+C to stop)...", name);
+    eprintln!("Live view of '{}' (press Ctrl+C to stop)...", name);
     let temp_path = std::env::temp_dir().join(format!("ipcam_live_{}.jpg", name));
 
     loop {
@@ -1131,6 +1170,7 @@ async fn cmd_stream(
     quality: StreamQuality,
     output: Option<PathBuf>,
     duration: u64,
+    json: bool,
 ) -> Result<()> {
     let cam_config = config
         .require_camera(name)?;
@@ -1140,10 +1180,24 @@ async fn cmd_stream(
     match output {
         Some(path) => {
             record_rtsp(&url, &path, duration).await?;
-            println!("Saved stream to {}", path.display());
+            if json {
+                println!("{}", serde_json::json!({
+                    "camera": name,
+                    "file": path.display().to_string(),
+                }));
+            } else {
+                println!("Saved stream to {}", path.display());
+            }
         }
         None => {
-            println!("{}", url);
+            if json {
+                println!("{}", serde_json::json!({
+                    "camera": name,
+                    "url": url,
+                }));
+            } else {
+                println!("{}", url);
+            }
         }
     }
     Ok(())
@@ -1154,6 +1208,7 @@ async fn cmd_record(
     name: &str,
     output: Option<PathBuf>,
     duration: u64,
+    json: bool,
 ) -> Result<()> {
     let cam_config = config
         .require_camera(name)?;
@@ -1167,7 +1222,15 @@ async fn cmd_record(
 
     tracing::info!("recording {}s from '{}'...", duration, name);
     record_rtsp(&url, &path, duration).await?;
-    println!("Saved recording to {}", path.display());
+    if json {
+        println!("{}", serde_json::json!({
+            "camera": name,
+            "file": path.display().to_string(),
+            "duration_secs": duration,
+        }));
+    } else {
+        println!("Saved recording to {}", path.display());
+    }
     Ok(())
 }
 
@@ -1779,25 +1842,32 @@ async fn cmd_frigate(config: &config::Config, action: FrigateAction, json: bool)
     Ok(())
 }
 
-fn cmd_config_path() -> Result<()> {
+fn cmd_config_path(json: bool) -> Result<()> {
     let path = config::Config::config_path()?;
-    println!("Config path: {}", path.display());
-    if path.exists() {
-        println!("Status: exists");
+    if json {
+        println!("{}", serde_json::json!({
+            "path": path.display().to_string(),
+            "exists": path.exists(),
+        }));
     } else {
-        println!("Status: not found");
-        println!();
-        println!("Create it with:");
-        println!();
-        println!("  mkdir -p {}", path.parent().unwrap().display());
-        println!("  cat > {} << 'EOF'", path.display());
-        println!("[[cameras]]");
-        println!("name = \"front-door\"");
-        println!("type = \"reolink\"");
-        println!("host = \"192.168.1.100\"");
-        println!("username = \"admin\"");
-        println!("password = \"your-password\"");
-        println!("EOF");
+        println!("Config path: {}", path.display());
+        if path.exists() {
+            println!("Status: exists");
+        } else {
+            println!("Status: not found");
+            println!();
+            println!("Create it with:");
+            println!();
+            println!("  mkdir -p {}", path.parent().unwrap().display());
+            println!("  cat > {} << 'EOF'", path.display());
+            println!("[[cameras]]");
+            println!("name = \"front-door\"");
+            println!("type = \"reolink\"");
+            println!("host = \"192.168.1.100\"");
+            println!("username = \"admin\"");
+            println!("password = \"your-password\"");
+            println!("EOF");
+        }
     }
     Ok(())
 }
@@ -1826,7 +1896,7 @@ fn cmd_config_edit() -> Result<()> {
     Ok(())
 }
 
-fn cmd_config_show() -> Result<()> {
+fn cmd_config_show(json: bool) -> Result<()> {
     let mut cfg = config::Config::load()?;
 
     // Mask passwords in all camera entries.
@@ -1836,9 +1906,13 @@ fn cmd_config_show() -> Result<()> {
         }
     }
 
-    let toml = toml::to_string_pretty(&cfg)
-        .context("serializing config to TOML")?;
-    print!("{toml}");
+    if json {
+        println!("{}", serde_json::to_string_pretty(&cfg)?);
+    } else {
+        let toml = toml::to_string_pretty(&cfg)
+            .context("serializing config to TOML")?;
+        print!("{toml}");
+    }
     Ok(())
 }
 
@@ -2248,5 +2322,29 @@ mod tests {
     fn parse_duration_error_message_contains_input() {
         let err = parse_duration("xyz").unwrap_err();
         assert!(err.to_string().contains("xyz"));
+    }
+
+    #[test]
+    fn redact_url_with_credentials() {
+        let url = "rtsp://admin:secret@192.168.1.100:554/stream";
+        assert_eq!(redact_url(url), "rtsp://****:****@192.168.1.100:554/stream");
+    }
+
+    #[test]
+    fn redact_url_without_credentials() {
+        let url = "rtsp://192.168.1.100:554/stream";
+        assert_eq!(redact_url(url), "rtsp://192.168.1.100:554/stream");
+    }
+
+    #[test]
+    fn redact_url_https() {
+        let url = "https://user:pass@example.com/api";
+        assert_eq!(redact_url(url), "https://****:****@example.com/api");
+    }
+
+    #[test]
+    fn redact_url_no_scheme() {
+        let url = "just-a-string";
+        assert_eq!(redact_url(url), "just-a-string");
     }
 }
