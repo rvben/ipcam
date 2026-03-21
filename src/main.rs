@@ -85,13 +85,13 @@ enum Command {
         #[arg(short, long, default_value = "main")]
         quality: StreamQuality,
 
-        /// Player to use: ffplay, mpv, vlc (default: auto-detect)
+        /// Player to use: ffplay, mpv, vlc (default: mpv inline)
         #[arg(short, long)]
         player: Option<String>,
 
-        /// Render video inline in the terminal (requires mpv with sixel/kitty support)
+        /// Open in a separate window instead of inline in the terminal
         #[arg(long)]
-        inline: bool,
+        window: bool,
     },
 
     /// Preview a camera snapshot in the terminal
@@ -504,8 +504,8 @@ async fn run() -> Result<()> {
             camera,
             quality,
             player,
-            inline,
-        } => cmd_live(&config, &camera, quality, player, inline).await,
+            window,
+        } => cmd_live(&config, &camera, quality, player, window).await,
         Command::Preview { camera, sub: _ } => cmd_preview(&config, &camera).await,
         Command::SnapshotAll { output_dir } => {
             cmd_snapshot_all(&config, output_dir, cli.json, false).await
@@ -739,18 +739,18 @@ async fn cmd_live(
     name: &str,
     quality: StreamQuality,
     player: Option<String>,
-    inline: bool,
+    window: bool,
 ) -> Result<()> {
     let cam_config = config.require_camera(name)?;
     let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
     let url = cam.rtsp_url(quality);
 
-    let (cmd, args) = if inline {
-        detect_inline_player(&url)?
-    } else if let Some(ref p) = player {
+    let (cmd, args) = if let Some(ref p) = player {
         player_args(p, &url)?
-    } else {
+    } else if window {
         detect_player(&url)?
+    } else {
+        detect_inline_player(&url)?
     };
 
     println!("Opening live stream from '{}' with {}...", name, cmd);
