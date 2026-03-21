@@ -85,11 +85,7 @@ enum Command {
         #[arg(short, long, default_value = "main")]
         quality: StreamQuality,
 
-        /// Player to use: ffplay, mpv, vlc (default: mpv inline)
-        #[arg(short, long)]
-        player: Option<String>,
-
-        /// Open in a separate window instead of inline in the terminal
+        /// Open in a separate window using ffplay instead of inline in the terminal
         #[arg(long)]
         window: bool,
     },
@@ -503,9 +499,8 @@ async fn run() -> Result<()> {
         Command::Live {
             camera,
             quality,
-            player,
             window,
-        } => cmd_live(&config, &camera, quality, player, window).await,
+        } => cmd_live(&config, &camera, quality, window).await,
         Command::Preview { camera, sub: _ } => cmd_preview(&config, &camera).await,
         Command::SnapshotAll { output_dir } => {
             cmd_snapshot_all(&config, output_dir, cli.json, false).await
@@ -738,100 +733,67 @@ async fn cmd_live(
     config: &config::Config,
     name: &str,
     quality: StreamQuality,
-    player: Option<String>,
     window: bool,
 ) -> Result<()> {
     let cam_config = config.require_camera(name)?;
     let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
     let url = cam.rtsp_url(quality);
 
-    let (cmd, args) = if let Some(ref p) = player {
-        player_args(p, &url)?
-    } else if window {
-        detect_player(&url)?
-    } else {
-        detect_inline_player(&url)?
-    };
-
-    println!("Opening live stream from '{}' with {}...", name, cmd);
-    let status = tokio::process::Command::new(&cmd)
-        .args(&args)
-        .status()
-        .await
-        .with_context(|| format!("{} not found. Install it or specify a player with --player", cmd))?;
-
-    if !status.success() {
-        bail!("{} exited with status {}", cmd, status);
+    if window {
+        println!("Opening live stream from '{}' in ffplay...", name);
+        let status = tokio::process::Command::new("ffplay")
+            .args([
+                "-rtsp_transport", "tcp",
+                "-loglevel", "error",
+                "-window_title", &format!("ipcam - {}", name),
+                &url,
+            ])
+            .status()
+            .await
+            .context("ffplay not found. It comes with ffmpeg — install ffmpeg first.")?;
+        if !status.success() {
+            bail!("ffplay exited with status {}", status);
+        }
+        return Ok(());
     }
-    Ok(())
-}
 
-fn detect_player(url: &str) -> Result<(String, Vec<String>)> {
-    for player in &["ffplay", "mpv", "vlc"] {
-        if which(player) {
-            return player_args(player, url);
+    // Inline mode: grab frames via ffmpeg and display with viuer
+    println!("Live view of '{}' (press Ctrl+C to stop)...", name);
+    let temp_path = std::env::temp_dir().join(format!("ipcam_live_{}.jpg", name));
+
+    loop {
+        let grab = async {
+            let status = tokio::process::Command::new("ffmpeg")
+                .args([
+                    "-rtsp_transport", "tcp",
+                    "-loglevel", "error",
+                    "-y",
+                    "-i", &url,
+                    "-frames:v", "1",
+                    "-update", "1",
+                ])
+                .arg(temp_path.as_os_str())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await;
+
+            if let Ok(s) = status && s.success() && temp_path.exists() {
+                    // Clear screen and move cursor to top-left to overwrite previous frame
+                    print!("\x1b[H\x1b[2J");
+                    let _ = print_image_preview(&temp_path);
+            }
+        };
+
+        tokio::select! {
+            () = grab => {}
+            _ = tokio::signal::ctrl_c() => break,
         }
     }
-    bail!(
-        "no video player found. Install one of: ffplay (comes with ffmpeg), mpv, or vlc"
-    );
-}
 
-fn detect_inline_player(url: &str) -> Result<(String, Vec<String>)> {
-    if which("mpv") {
-        // Try sixel first (widely supported), fall back to kitty, then tct (block chars)
-        let vo = if std::env::var("TERM_PROGRAM").as_deref() == Ok("iTerm.app") {
-            "sixel"
-        } else if std::env::var("TERM").as_deref() == Ok("xterm-kitty") {
-            "kitty"
-        } else {
-            "tct"
-        };
-        Ok((
-            "mpv".to_string(),
-            vec![
-                format!("--vo={}", vo),
-                "--profile=low-latency".to_string(),
-                url.to_string(),
-            ],
-        ))
-    } else {
-        bail!("--inline requires mpv. Install it with: brew install mpv (macOS) or apt install mpv (Linux)");
-    }
-}
-
-fn player_args(player: &str, url: &str) -> Result<(String, Vec<String>)> {
-    let args = match player {
-        "ffplay" => vec![
-            "-rtsp_transport".to_string(),
-            "tcp".to_string(),
-            "-loglevel".to_string(),
-            "error".to_string(),
-            "-window_title".to_string(),
-            "ipcam".to_string(),
-            url.to_string(),
-        ],
-        "mpv" => vec![
-            "--profile=low-latency".to_string(),
-            url.to_string(),
-        ],
-        "vlc" => vec![
-            "--intf".to_string(),
-            "dummy".to_string(),
-            url.to_string(),
-        ],
-        _ => vec![url.to_string()],
-    };
-    Ok((player.to_string(), args))
-}
-
-fn which(cmd: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(cmd)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    std::fs::remove_file(&temp_path).ok();
+    println!("\nStopped.");
+    Ok(())
 }
 
 async fn cmd_snapshot_all(
