@@ -86,7 +86,7 @@ enum Command {
         camera: String,
 
         /// Stream quality
-        #[arg(short, long, default_value = "main")]
+        #[arg(long, default_value = "main")]
         quality: StreamQuality,
 
         /// Open in a separate window using ffplay instead of inline in the terminal
@@ -117,7 +117,7 @@ enum Command {
         camera: String,
 
         /// Stream quality
-        #[arg(short, long, default_value = "main")]
+        #[arg(long, default_value = "main")]
         quality: StreamQuality,
 
         /// Pipe stream to file using ffmpeg
@@ -2169,6 +2169,8 @@ fn cmd_add(
         go2rtc_stream: go2rtc_stream.map(|s| s.to_string()),
         onvif_port: None,
         frigate_name: None,
+        main_stream: None,
+        sub_stream: None,
     };
 
     config.cameras.push(new_camera);
