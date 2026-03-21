@@ -233,7 +233,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
                 ]),
                 Line::from(vec![
                     Span::styled("  RTSP: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(&cam.rtsp_url),
+                    Span::raw(crate::redact_url(&cam.rtsp_url)),
                 ]),
                 Line::from(vec![
                     Span::styled("  ONVIF: ", Style::default().fg(Color::DarkGray)),

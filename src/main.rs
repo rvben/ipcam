@@ -452,7 +452,7 @@ fn print_error(err: &anyhow::Error) {
 
 /// Redact credentials from an RTSP URL for safe logging/display.
 /// Turns `rtsp://user:pass@host/path` into `rtsp://****:****@host/path`.
-fn redact_url(url: &str) -> String {
+pub(crate) fn redact_url(url: &str) -> String {
     if let Some(at_pos) = url.find('@')
         && let Some(scheme_end) = url.find("://")
     {
