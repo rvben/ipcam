@@ -581,14 +581,14 @@ async fn run_with(cli: Cli) -> Result<()> {
             action,
             preset,
             speed,
-        } => cmd_ptz(&config, &camera, action, preset, speed).await,
+        } => cmd_ptz(&config, &camera, action, preset, speed, cli.json).await,
         Command::Watch { interval, exec } => {
             let interval = parse_duration(&interval)?;
             cmd_watch(&config, interval, exec.as_deref()).await
         }
         Command::Test { camera } => cmd_test(&config, camera.as_deref(), cli.json).await,
         Command::Tui { interval } => tui::run_tui(&config, interval).await,
-        Command::Rename { old_name, new_name } => cmd_rename(&old_name, &new_name, cli.config.as_deref()),
+        Command::Rename { old_name, new_name } => cmd_rename(&old_name, &new_name, cli.config.as_deref(), cli.json),
         Command::Add {
             host,
             name,
@@ -597,8 +597,8 @@ async fn run_with(cli: Cli) -> Result<()> {
             password,
             rtsp_port,
             go2rtc_stream,
-        } => cmd_add(&host, name.as_deref(), r#type, &username, password.as_deref(), rtsp_port, go2rtc_stream.as_deref(), cli.config.as_deref()),
-        Command::Remove { name, yes } => cmd_remove(&name, yes, cli.config.as_deref()),
+        } => cmd_add(&host, name.as_deref(), r#type, &username, password.as_deref(), rtsp_port, go2rtc_stream.as_deref(), cli.config.as_deref(), cli.json),
+        Command::Remove { name, yes } => cmd_remove(&name, yes, cli.config.as_deref(), cli.json),
         Command::Completions { .. } | Command::Init { .. } => {
             unreachable!("handled before config load")
         }
@@ -1542,52 +1542,71 @@ async fn cmd_ptz(
     action: PtzAction,
     preset: Option<u32>,
     speed: u8,
+    json: bool,
 ) -> Result<()> {
-    let cam_config = config
-        .require_camera(name)?;
+    let cam_config = config.require_camera(name)?;
     let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
 
-    // Normalize speed from 1-9 range to 0.0-1.0
     let normalized_speed = speed as f32 / 9.0;
 
-    match action {
+    let action_str = match action {
         PtzAction::Left => {
             cam.ptz_move(PtzDirection::Left, normalized_speed).await?;
-            println!("Moving '{}' left (speed {})", name, speed);
+            "left"
         }
         PtzAction::Right => {
             cam.ptz_move(PtzDirection::Right, normalized_speed).await?;
-            println!("Moving '{}' right (speed {})", name, speed);
+            "right"
         }
         PtzAction::Up => {
             cam.ptz_move(PtzDirection::Up, normalized_speed).await?;
-            println!("Moving '{}' up (speed {})", name, speed);
+            "up"
         }
         PtzAction::Down => {
             cam.ptz_move(PtzDirection::Down, normalized_speed).await?;
-            println!("Moving '{}' down (speed {})", name, speed);
+            "down"
         }
         PtzAction::Stop => {
             cam.ptz_stop().await?;
-            println!("Stopped PTZ movement on '{}'", name);
+            "stop"
         }
         PtzAction::Preset => {
             let num = preset
                 .ok_or_else(|| anyhow::anyhow!("preset number is required for 'preset' action"))?;
             cam.ptz_goto_preset(num).await?;
-            println!("Moving '{}' to preset {}", name, num);
+            "preset"
         }
         PtzAction::ZoomIn => {
             cam.ptz_zoom(normalized_speed).await?;
-            println!("Zooming in on '{}' (speed {})", name, speed);
+            "zoom-in"
         }
         PtzAction::ZoomOut => {
             cam.ptz_zoom(-normalized_speed).await?;
-            println!("Zooming out on '{}' (speed {})", name, speed);
+            "zoom-out"
         }
         PtzAction::Home => {
             cam.ptz_home().await?;
-            println!("Moving '{}' to home position", name);
+            "home"
+        }
+    };
+
+    if json {
+        let mut result = serde_json::json!({
+            "camera": name,
+            "action": action_str,
+            "speed": speed,
+            "success": true,
+        });
+        if let Some(p) = preset {
+            result["preset"] = serde_json::json!(p);
+        }
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        match action {
+            PtzAction::Stop => println!("Stopped PTZ movement on '{}'", name),
+            PtzAction::Preset => println!("Moving '{}' to preset {}", name, preset.unwrap()),
+            PtzAction::Home => println!("Moving '{}' to home position", name),
+            _ => println!("PTZ '{}' {} (speed {})", name, action_str, speed),
         }
     }
 
@@ -2153,6 +2172,7 @@ fn cmd_add(
     rtsp_port: u16,
     go2rtc_stream: Option<&str>,
     config_path: Option<&Path>,
+    json: bool,
 ) -> Result<()> {
     let mut config = config::Config::load(config_path)?;
 
@@ -2206,15 +2226,28 @@ fn cmd_add(
     std::fs::write(&path, content)
         .with_context(|| format!("writing {}", path.display()))?;
 
-    println!(
-        "Added camera '{}' ({} @ {})",
-        resolved_name, camera_type, host
-    );
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "action": "added",
+                "camera": resolved_name,
+                "host": host,
+                "type": camera_type.to_string(),
+                "rtsp_port": rtsp_port,
+            })
+        );
+    } else {
+        println!(
+            "Added camera '{}' ({} @ {})",
+            resolved_name, camera_type, host
+        );
+    }
 
     Ok(())
 }
 
-fn cmd_remove(name: &str, yes: bool, config_path: Option<&Path>) -> Result<()> {
+fn cmd_remove(name: &str, yes: bool, config_path: Option<&Path>, json: bool) -> Result<()> {
     let mut config = config::Config::load(config_path)?;
 
     // Validate the camera exists (require_camera gives a good error message)
@@ -2226,12 +2259,17 @@ fn cmd_remove(name: &str, yes: bool, config_path: Option<&Path>) -> Result<()> {
         .expect("require_camera succeeded so position must exist");
 
     let cam = &config.cameras[pos];
-    println!(
-        "Will remove: '{}' ({} @ {})",
-        cam.name, cam.camera_type, cam.host
-    );
+    let cam_type = cam.camera_type.to_string();
+    let cam_host = cam.host.clone();
 
-    if !yes {
+    if !json {
+        println!(
+            "Will remove: '{}' ({} @ {})",
+            cam.name, cam.camera_type, cam.host
+        );
+    }
+
+    if !yes && !json {
         use std::io::Write as _;
         print!("Confirm removal? [y/N]: ");
         std::io::stdout().flush().context("flush stdout")?;
@@ -2253,12 +2291,24 @@ fn cmd_remove(name: &str, yes: bool, config_path: Option<&Path>) -> Result<()> {
     std::fs::write(&path, content)
         .with_context(|| format!("writing {}", path.display()))?;
 
-    println!("Removed camera '{}'.", name);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "action": "removed",
+                "camera": name,
+                "host": cam_host,
+                "type": cam_type,
+            })
+        );
+    } else {
+        println!("Removed camera '{}'.", name);
+    }
 
     Ok(())
 }
 
-fn cmd_rename(old_name: &str, new_name: &str, config_path: Option<&Path>) -> Result<()> {
+fn cmd_rename(old_name: &str, new_name: &str, config_path: Option<&Path>, json: bool) -> Result<()> {
     let mut config = config::Config::load(config_path)?;
 
     // Verify old_name exists (require_camera gives a good error message).
@@ -2302,12 +2352,25 @@ fn cmd_rename(old_name: &str, new_name: &str, config_path: Option<&Path>) -> Res
     std::fs::write(&path, content)
         .with_context(|| format!("writing {}", path.display()))?;
 
-    println!("Renamed camera '{}' -> '{}'", old_name, new_name);
-    if updated_go2rtc {
-        println!("  go2rtc_stream: '{}' -> '{}'", old_auto, new_auto);
-    }
-    if updated_frigate {
-        println!("  frigate_name:  '{}' -> '{}'", old_auto, new_auto);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "action": "renamed",
+                "old_name": old_name,
+                "new_name": new_name,
+                "updated_go2rtc": updated_go2rtc,
+                "updated_frigate": updated_frigate,
+            })
+        );
+    } else {
+        println!("Renamed camera '{}' -> '{}'", old_name, new_name);
+        if updated_go2rtc {
+            println!("  go2rtc_stream: '{}' -> '{}'", old_auto, new_auto);
+        }
+        if updated_frigate {
+            println!("  frigate_name:  '{}' -> '{}'", old_auto, new_auto);
+        }
     }
 
     Ok(())
