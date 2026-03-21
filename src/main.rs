@@ -254,8 +254,8 @@ enum Command {
         camera: Option<String>,
     },
 
-    /// Live TUI dashboard showing all camera statuses
-    Dashboard {
+    /// Live TUI showing all camera statuses
+    Tui {
         /// Refresh interval in seconds
         #[arg(short, long, default_value = "5")]
         interval: u64,
@@ -587,7 +587,7 @@ async fn run_with(cli: Cli) -> Result<()> {
             cmd_watch(&config, interval, exec.as_deref()).await
         }
         Command::Test { camera } => cmd_test(&config, camera.as_deref(), cli.json).await,
-        Command::Dashboard { interval } => tui::run_dashboard(&config, interval).await,
+        Command::Tui { interval } => tui::run_tui(&config, interval).await,
         Command::Rename { old_name, new_name } => cmd_rename(&old_name, &new_name, cli.config.as_deref()),
         Command::Add {
             host,
