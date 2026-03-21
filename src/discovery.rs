@@ -103,18 +103,47 @@ fn address_from_url(url: &str) -> String {
         .unwrap_or_else(|| url.to_string())
 }
 
+/// List all local IPv4 addresses by parsing `ifconfig` output.
+fn local_ipv4_addresses() -> Vec<Ipv4Addr> {
+    let output = std::process::Command::new("ifconfig")
+        .output()
+        .ok()
+        .filter(|o| o.status.success());
+
+    let Some(output) = output else {
+        return vec![Ipv4Addr::UNSPECIFIED];
+    };
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut addrs = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("inet ")
+            && let Some(ip_str) = rest.split_whitespace().next()
+            && let Ok(ip) = ip_str.parse::<Ipv4Addr>()
+            && !ip.is_loopback()
+        {
+            addrs.push(ip);
+        }
+    }
+
+    if addrs.is_empty() {
+        vec![Ipv4Addr::UNSPECIFIED]
+    } else {
+        addrs
+    }
+}
+
 /// Send a WS-Discovery Probe over UDP multicast and collect raw XML responses.
+/// Sends on all local interfaces to ensure cameras on any subnet are reached.
 fn send_probe(timeout: Duration) -> Result<Vec<String>> {
     let socket = UdpSocket::bind(LOCAL_BIND_ADDR).context("bind UDP socket")?;
     socket
         .set_read_timeout(Some(Duration::from_millis(200)))
         .context("set read timeout")?;
 
-    // Join the multicast group so we can receive responses.
     let multicast_addr: Ipv4Addr = "239.255.255.250".parse().unwrap();
-    socket
-        .join_multicast_v4(&multicast_addr, &Ipv4Addr::UNSPECIFIED)
-        .context("join multicast group")?;
+    let local_ips = local_ipv4_addresses();
 
     // Generate a UUID-like message ID from the current time.
     let msg_id = format!(
@@ -134,9 +163,35 @@ fn send_probe(timeout: Duration) -> Result<Vec<String>> {
 
     let probe = build_probe_message(&msg_id);
     let dest: SocketAddr = WS_DISCOVERY_ADDR.parse().unwrap();
-    socket
-        .send_to(probe.as_bytes(), dest)
-        .context("send Probe")?;
+
+    // Send probe on each local interface so cameras on any subnet are reached.
+    for ip in &local_ips {
+        if let Err(e) = socket.join_multicast_v4(&multicast_addr, ip) {
+            tracing::debug!("join multicast on {}: {}", ip, e);
+        }
+        // Set outgoing interface for this probe.
+        let octets = ip.octets();
+        // Set outgoing multicast interface via setsockopt IP_MULTICAST_IF.
+        use std::os::unix::io::AsRawFd;
+        let fd = socket.as_raw_fd();
+        let result = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                libc::IP_MULTICAST_IF,
+                octets.as_ptr() as *const libc::c_void,
+                4,
+            )
+        };
+        if result != 0 {
+            tracing::debug!("set multicast IF {}: errno {}", ip, std::io::Error::last_os_error());
+            continue;
+        }
+        tracing::debug!("sending probe via {}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]);
+        if let Err(e) = socket.send_to(probe.as_bytes(), dest) {
+            tracing::debug!("send probe via {}: {}", ip, e);
+        }
+    }
 
     let deadline = std::time::Instant::now() + timeout;
     let mut buf = vec![0u8; 65535];
