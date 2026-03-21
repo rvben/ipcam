@@ -108,3 +108,69 @@ jobs:
         with:
           generate_release_notes: true
           files: release/*
+
+  update-homebrew:
+    name: Update Homebrew Tap
+    needs: [release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download release binaries
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          mkdir -p binaries
+          for artifact in ipcam-macos-aarch64 ipcam-macos-x86_64 ipcam-linux-x86_64; do
+            gh release download "$GITHUB_REF_NAME" \
+              --repo rvben/ipcam \
+              --pattern "$artifact" \
+              --dir binaries
+          done
+
+      - name: Compute checksums
+        id: checksums
+        run: |
+          echo "macos_aarch64=$(sha256sum binaries/ipcam-macos-aarch64 | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "macos_x86_64=$(sha256sum binaries/ipcam-macos-x86_64 | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "linux_x86_64=$(sha256sum binaries/ipcam-linux-x86_64 | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Update Homebrew formula
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git clone https://x-access-token:${GH_TOKEN}@github.com/rvben/homebrew-tap.git
+          cd homebrew-tap
+
+          VERSION="${{ steps.version.outputs.version }}"
+          SHA_MACOS_ARM="${{ steps.checksums.outputs.macos_aarch64 }}"
+          SHA_MACOS_X86="${{ steps.checksums.outputs.macos_x86_64 }}"
+          SHA_LINUX_X86="${{ steps.checksums.outputs.linux_x86_64 }}"
+
+          # Update version
+          sed -i "s/version \".*\"/version \"${VERSION}\"/" Formula/ipcam.rb
+
+          # Update checksums by matching the url line preceding each sha256
+          python3 -c "
+          import re, sys
+          with open('Formula/ipcam.rb') as f:
+              content = f.read()
+          shas = {
+              'macos-aarch64': '${SHA_MACOS_ARM}',
+              'macos-x86_64': '${SHA_MACOS_X86}',
+              'linux-x86_64': '${SHA_LINUX_X86}',
+          }
+          for artifact, sha in shas.items():
+              pattern = r'(url \"[^\"]*' + re.escape(artifact) + r'[^\"]*\"\s*\n\s*sha256 \")[a-f0-9]{64}(\")'
+              content = re.sub(pattern, r'\g<1>' + sha + r'\2', content)
+          with open('Formula/ipcam.rb', 'w') as f:
+              f.write(content)
+          "
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/ipcam.rb
+          git commit -m "feat(ipcam): update to v${VERSION}"
+          git push
