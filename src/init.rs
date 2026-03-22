@@ -162,6 +162,8 @@ pub(crate) fn prompt_for_camera(cam: &DiscoveredCamera) -> Result<Option<CameraC
         frigate_name: None,
         main_stream: None,
         sub_stream: None,
+        onvif_username: None,
+        onvif_password: None,
     }))
 }
 
@@ -184,6 +186,8 @@ pub(crate) fn auto_camera_config(cam: &DiscoveredCamera) -> Option<CameraConfig>
         frigate_name: None,
         main_stream: None,
         sub_stream: None,
+        onvif_username: None,
+        onvif_password: None,
     })
 }
 

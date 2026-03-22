@@ -2411,6 +2411,8 @@ fn cmd_add_direct(
         frigate_name: None,
         main_stream: None,
         sub_stream: None,
+        onvif_username: None,
+        onvif_password: None,
     };
 
     config.cameras.push(new_camera);

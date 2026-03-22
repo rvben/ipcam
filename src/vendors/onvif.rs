@@ -16,6 +16,8 @@ pub struct OnvifCamera {
     onvif_port: u16,
     username: String,
     password: String,
+    onvif_username: String,
+    onvif_password: String,
     main_stream: String,
     sub_stream: String,
     go2rtc_stream: Option<String>,
@@ -27,6 +29,7 @@ impl OnvifCamera {
     pub fn new(config: &CameraConfig, go2rtc: Option<&Go2rtcConfig>) -> Result<Self> {
         let username = config.username.clone().unwrap_or_default();
         let password = config.password.clone().unwrap_or_default();
+        let (onvif_username, onvif_password) = config.onvif_credentials();
 
         let main_stream = config
             .main_stream
@@ -44,6 +47,8 @@ impl OnvifCamera {
             onvif_port: config.onvif_port(),
             username,
             password,
+            onvif_username,
+            onvif_password,
             main_stream,
             sub_stream,
             go2rtc_stream: config.go2rtc_stream.clone(),
@@ -90,7 +95,7 @@ impl OnvifCamera {
 impl Camera for OnvifCamera {
     async fn info(&self) -> Result<CameraInfo> {
         let body = r#"<tds:GetDeviceInformation xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>"#;
-        let envelope = soap::soap_envelope(&self.username, &self.password, body);
+        let envelope = soap::soap_envelope(&self.onvif_username, &self.onvif_password, body);
 
         let resp = self
             .client
@@ -127,8 +132,8 @@ impl Camera for OnvifCamera {
             &self.name,
             &self.host,
             self.onvif_port,
-            &self.username,
-            &self.password,
+            &self.onvif_username,
+            &self.onvif_password,
             &rtsp_url,
         )
         .await
@@ -148,8 +153,8 @@ impl Camera for OnvifCamera {
             &self.host,
             self.rtsp_port,
             &self.device_service_url(),
-            &self.username,
-            &self.password,
+            &self.onvif_username,
+            &self.onvif_password,
             "ONVIF",
         )
         .await
@@ -168,8 +173,8 @@ impl Camera for OnvifCamera {
         soap::send_ptz_soap(
             &self.client,
             &self.ptz_url(),
-            &self.username,
-            &self.password,
+            &self.onvif_username,
+            &self.onvif_password,
             &self.name,
             &self.host,
             &body,
@@ -186,8 +191,8 @@ impl Camera for OnvifCamera {
         soap::send_ptz_soap(
             &self.client,
             &self.ptz_url(),
-            &self.username,
-            &self.password,
+            &self.onvif_username,
+            &self.onvif_password,
             &self.name,
             &self.host,
             body,
@@ -205,8 +210,8 @@ impl Camera for OnvifCamera {
         soap::send_ptz_soap(
             &self.client,
             &self.ptz_url(),
-            &self.username,
-            &self.password,
+            &self.onvif_username,
+            &self.onvif_password,
             &self.name,
             &self.host,
             &body,
@@ -226,8 +231,8 @@ impl Camera for OnvifCamera {
         soap::send_ptz_soap(
             &self.client,
             &self.ptz_url(),
-            &self.username,
-            &self.password,
+            &self.onvif_username,
+            &self.onvif_password,
             &self.name,
             &self.host,
             &body,
@@ -242,8 +247,8 @@ impl Camera for OnvifCamera {
         soap::send_ptz_soap(
             &self.client,
             &self.ptz_url(),
-            &self.username,
-            &self.password,
+            &self.onvif_username,
+            &self.onvif_password,
             &self.name,
             &self.host,
             body,
@@ -270,6 +275,8 @@ mod tests {
             frigate_name: None,
             main_stream: None,
             sub_stream: None,
+            onvif_username: None,
+            onvif_password: None,
         }
     }
 

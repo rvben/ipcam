@@ -283,6 +283,8 @@ mod tests {
             frigate_name: None,
             main_stream: None,
             sub_stream: None,
+            onvif_username: None,
+            onvif_password: None,
         }
     }
 

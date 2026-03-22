@@ -67,6 +67,10 @@ pub struct CameraConfig {
     pub main_stream: Option<String>,
     /// Custom RTSP sub stream path (default varies by vendor)
     pub sub_stream: Option<String>,
+    /// Separate ONVIF username (if different from RTSP credentials)
+    pub onvif_username: Option<String>,
+    /// Separate ONVIF password (if different from RTSP credentials)
+    pub onvif_password: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -95,6 +99,21 @@ impl CameraConfig {
             CameraType::Reolink => 8000,
             CameraType::Onvif => 80,
         })
+    }
+
+    /// Returns ONVIF credentials, falling back to the RTSP credentials.
+    pub fn onvif_credentials(&self) -> (String, String) {
+        let username = self
+            .onvif_username
+            .clone()
+            .or_else(|| self.username.clone())
+            .unwrap_or_default();
+        let password = self
+            .onvif_password
+            .clone()
+            .or_else(|| self.password.clone())
+            .unwrap_or_default();
+        (username, password)
     }
 
     /// Returns the Frigate camera name, falling back to the config name with
@@ -250,6 +269,8 @@ go2rtc_stream = "kids_room"
             frigate_name: None,
             main_stream: None,
             sub_stream: None,
+            onvif_username: None,
+            onvif_password: None,
         }
     }
 
@@ -356,6 +377,42 @@ host = "10.0.0.1"
         let mut cam = make_camera(CameraType::Tapo);
         cam.onvif_port = Some(9999);
         assert_eq!(cam.onvif_port(), 9999);
+    }
+
+    // --- onvif_credentials() ---
+
+    #[test]
+    fn onvif_credentials_falls_back_to_rtsp() {
+        let mut cam = make_camera(CameraType::Tapo);
+        cam.username = Some("rtsp_user".to_string());
+        cam.password = Some("rtsp_pass".to_string());
+        let (user, pass) = cam.onvif_credentials();
+        assert_eq!(user, "rtsp_user");
+        assert_eq!(pass, "rtsp_pass");
+    }
+
+    #[test]
+    fn onvif_credentials_uses_dedicated_when_set() {
+        let mut cam = make_camera(CameraType::Tapo);
+        cam.username = Some("rtsp_user".to_string());
+        cam.password = Some("rtsp_pass".to_string());
+        cam.onvif_username = Some("onvif_user".to_string());
+        cam.onvif_password = Some("onvif_pass".to_string());
+        let (user, pass) = cam.onvif_credentials();
+        assert_eq!(user, "onvif_user");
+        assert_eq!(pass, "onvif_pass");
+    }
+
+    #[test]
+    fn onvif_credentials_partial_override() {
+        let mut cam = make_camera(CameraType::Tapo);
+        cam.username = Some("rtsp_user".to_string());
+        cam.password = Some("rtsp_pass".to_string());
+        cam.onvif_username = Some("onvif_user".to_string());
+        // onvif_password not set, should fall back to rtsp password
+        let (user, pass) = cam.onvif_credentials();
+        assert_eq!(user, "onvif_user");
+        assert_eq!(pass, "rtsp_pass");
     }
 
     // --- frigate_name() ---

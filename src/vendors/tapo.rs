@@ -15,6 +15,8 @@ pub struct TapoCamera {
     onvif_port: u16,
     username: String,
     password: String,
+    onvif_username: String,
+    onvif_password: String,
     go2rtc_stream: Option<String>,
     go2rtc: Option<Go2rtcConfig>,
     client: reqwest::Client,
@@ -24,6 +26,7 @@ impl TapoCamera {
     pub fn new(config: &CameraConfig, go2rtc: Option<&Go2rtcConfig>) -> Result<Self> {
         let username = config.username.clone().unwrap_or_default();
         let password = config.password.clone().unwrap_or_default();
+        let (onvif_username, onvif_password) = config.onvif_credentials();
 
         Ok(Self {
             name: config.name.clone(),
@@ -32,6 +35,8 @@ impl TapoCamera {
             onvif_port: config.onvif_port(),
             username,
             password,
+            onvif_username,
+            onvif_password,
             go2rtc_stream: config.go2rtc_stream.clone(),
             go2rtc: go2rtc.cloned(),
             client: reqwest::Client::new(),
@@ -87,8 +92,8 @@ impl Camera for TapoCamera {
             &self.name,
             &self.host,
             self.onvif_port,
-            &self.username,
-            &self.password,
+            &self.onvif_username,
+            &self.onvif_password,
             &rtsp_url,
         )
         .await
@@ -108,8 +113,8 @@ impl Camera for TapoCamera {
             &self.host,
             self.rtsp_port,
             &self.device_service_url(),
-            &self.username,
-            &self.password,
+            &self.onvif_username,
+            &self.onvif_password,
             "Tapo",
         )
         .await
@@ -128,8 +133,8 @@ impl Camera for TapoCamera {
         soap::send_ptz_soap(
             &self.client,
             &self.ptz_url(),
-            &self.username,
-            &self.password,
+            &self.onvif_username,
+            &self.onvif_password,
             &self.name,
             &self.host,
             &body,
@@ -146,8 +151,8 @@ impl Camera for TapoCamera {
         soap::send_ptz_soap(
             &self.client,
             &self.ptz_url(),
-            &self.username,
-            &self.password,
+            &self.onvif_username,
+            &self.onvif_password,
             &self.name,
             &self.host,
             body,
@@ -165,8 +170,8 @@ impl Camera for TapoCamera {
         soap::send_ptz_soap(
             &self.client,
             &self.ptz_url(),
-            &self.username,
-            &self.password,
+            &self.onvif_username,
+            &self.onvif_password,
             &self.name,
             &self.host,
             &body,
@@ -186,8 +191,8 @@ impl Camera for TapoCamera {
         soap::send_ptz_soap(
             &self.client,
             &self.ptz_url(),
-            &self.username,
-            &self.password,
+            &self.onvif_username,
+            &self.onvif_password,
             &self.name,
             &self.host,
             &body,
@@ -202,8 +207,8 @@ impl Camera for TapoCamera {
         soap::send_ptz_soap(
             &self.client,
             &self.ptz_url(),
-            &self.username,
-            &self.password,
+            &self.onvif_username,
+            &self.onvif_password,
             &self.name,
             &self.host,
             body,
@@ -230,6 +235,8 @@ mod tests {
             frigate_name: None,
             main_stream: None,
             sub_stream: None,
+            onvif_username: None,
+            onvif_password: None,
         }
     }
 
