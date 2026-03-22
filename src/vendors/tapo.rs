@@ -1,15 +1,13 @@
-use std::time::Instant;
-
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use base64::Engine;
-use sha1::{Digest, Sha1};
 
 use crate::camera::{
     Camera, CameraInfo, HealthStatus, ImageFormat, MotionStatus, PtzDirection, Snapshot,
     StreamQuality,
 };
 use crate::config::{CameraConfig, Go2rtcConfig};
+
+use super::soap;
 
 pub struct TapoCamera {
     name: String,
@@ -45,96 +43,11 @@ impl TapoCamera {
         format!("http://{}:{}/onvif/ptz_service", self.host, self.onvif_port)
     }
 
-    /// Build a SOAP envelope with WS-Security UsernameToken using Password Digest.
-    /// Digest = Base64(SHA1(nonce + created + password))
-    fn soap_envelope(&self, body: &str) -> String {
-        let nonce_bytes: [u8; 16] = rand::random();
-        let nonce_b64 = base64::engine::general_purpose::STANDARD.encode(nonce_bytes);
-        let created = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-
-        let mut hasher = Sha1::new();
-        hasher.update(nonce_bytes);
-        hasher.update(created.as_bytes());
-        hasher.update(self.password.as_bytes());
-        let digest = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
-
+    fn device_service_url(&self) -> String {
         format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
-            xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
-            xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
-  <s:Header>
-    <wsse:Security>
-      <wsse:UsernameToken>
-        <wsse:Username>{username}</wsse:Username>
-        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{digest}</wsse:Password>
-        <wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">{nonce}</wsse:Nonce>
-        <wsu:Created>{created}</wsu:Created>
-      </wsse:UsernameToken>
-    </wsse:Security>
-  </s:Header>
-  <s:Body>
-    {body}
-  </s:Body>
-</s:Envelope>"#,
-            username = self.username,
-            digest = digest,
-            nonce = nonce_b64,
-            created = created,
-            body = body,
+            "http://{}:{}/onvif/device_service",
+            self.host, self.onvif_port
         )
-    }
-
-    async fn send_ptz_soap(&self, body: &str) -> Result<()> {
-        let envelope = self.soap_envelope(body);
-        let resp = self
-            .client
-            .post(self.ptz_url())
-            .header("Content-Type", "application/soap+xml; charset=utf-8")
-            .body(envelope)
-            .send()
-            .await
-            .with_context(|| format!(
-                "camera '{}' at {} is not reachable (ONVIF PTZ service)",
-                self.name, self.host
-            ))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            bail!("ONVIF PTZ request failed ({}): {}", status, text);
-        }
-        Ok(())
-    }
-
-    /// Query model name via ONVIF GetDeviceInformation (with auth).
-    async fn query_model_name(&self) -> Option<String> {
-        let url = format!("http://{}:{}/onvif/device_service", self.host, self.onvif_port);
-        let body = self.soap_envelope(
-            r#"<tds:GetDeviceInformation xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>"#,
-        );
-        let resp = self
-            .client
-            .post(&url)
-            .header("Content-Type", "application/soap+xml; charset=utf-8")
-            .body(body)
-            .timeout(std::time::Duration::from_secs(2))
-            .send()
-            .await
-            .ok()?;
-        let xml = resp.text().await.ok()?;
-        let model = crate::discovery::extract_xml_elements(&xml, "Model")
-            .into_iter()
-            .next()?;
-        let mfr = crate::discovery::extract_xml_elements(&xml, "Manufacturer")
-            .into_iter()
-            .next()
-            .unwrap_or_default();
-        if mfr.is_empty() {
-            Some(model)
-        } else {
-            Some(format!("{} {}", mfr, model))
-        }
     }
 
     fn effective_rtsp_url(&self, quality: StreamQuality) -> String {
@@ -219,34 +132,15 @@ impl Camera for TapoCamera {
     }
 
     async fn is_reachable(&self) -> HealthStatus {
-        let start = Instant::now();
-        let addr = format!("{}:{}", self.host, self.rtsp_port);
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            tokio::net::TcpStream::connect(&addr),
+        soap::check_reachable(
+            &self.client,
+            &self.host,
+            self.rtsp_port,
+            &self.device_service_url(),
+            &self.username,
+            &self.password,
         )
         .await
-        {
-            Ok(Ok(_)) => {
-                // Try to get model name via ONVIF for a richer status detail
-                let detail = self.query_model_name().await.unwrap_or(addr);
-                HealthStatus {
-                    online: true,
-                    detail,
-                    latency: start.elapsed(),
-                }
-            }
-            Ok(Err(e)) => HealthStatus {
-                online: false,
-                detail: e.to_string(),
-                latency: start.elapsed(),
-            },
-            Err(_) => HealthStatus {
-                online: false,
-                detail: "connection timed out".to_string(),
-                latency: start.elapsed(),
-            },
-        }
     }
 
     async fn ptz_move(&self, direction: PtzDirection, speed: f32) -> Result<()> {
@@ -259,7 +153,16 @@ impl Camera for TapoCamera {
   </tptz:Velocity>
 </tptz:ContinuousMove>"#,
         );
-        self.send_ptz_soap(&body).await
+        soap::send_ptz_soap(
+            &self.client,
+            &self.ptz_url(),
+            &self.username,
+            &self.password,
+            &self.name,
+            &self.host,
+            &body,
+        )
+        .await
     }
 
     async fn ptz_stop(&self) -> Result<()> {
@@ -268,7 +171,16 @@ impl Camera for TapoCamera {
   <tptz:PanTilt>true</tptz:PanTilt>
   <tptz:Zoom>true</tptz:Zoom>
 </tptz:Stop>"#;
-        self.send_ptz_soap(body).await
+        soap::send_ptz_soap(
+            &self.client,
+            &self.ptz_url(),
+            &self.username,
+            &self.password,
+            &self.name,
+            &self.host,
+            body,
+        )
+        .await
     }
 
     async fn ptz_goto_preset(&self, preset: u32) -> Result<()> {
@@ -278,7 +190,16 @@ impl Camera for TapoCamera {
   <tptz:PresetToken>{preset}</tptz:PresetToken>
 </tptz:GotoPreset>"#,
         );
-        self.send_ptz_soap(&body).await
+        soap::send_ptz_soap(
+            &self.client,
+            &self.ptz_url(),
+            &self.username,
+            &self.password,
+            &self.name,
+            &self.host,
+            &body,
+        )
+        .await
     }
 
     async fn ptz_zoom(&self, speed: f32) -> Result<()> {
@@ -290,14 +211,32 @@ impl Camera for TapoCamera {
   </tptz:Velocity>
 </tptz:ContinuousMove>"#,
         );
-        self.send_ptz_soap(&body).await
+        soap::send_ptz_soap(
+            &self.client,
+            &self.ptz_url(),
+            &self.username,
+            &self.password,
+            &self.name,
+            &self.host,
+            &body,
+        )
+        .await
     }
 
     async fn ptz_home(&self) -> Result<()> {
         let body = r#"<tptz:GotoHomePosition xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
   <tptz:ProfileToken>profile_1</tptz:ProfileToken>
 </tptz:GotoHomePosition>"#;
-        self.send_ptz_soap(body).await
+        soap::send_ptz_soap(
+            &self.client,
+            &self.ptz_url(),
+            &self.username,
+            &self.password,
+            &self.name,
+            &self.host,
+            body,
+        )
+        .await
     }
 }
 

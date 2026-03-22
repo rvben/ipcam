@@ -1,5 +1,6 @@
 pub mod onvif;
 pub mod reolink;
+pub mod soap;
 pub mod tapo;
 
 use anyhow::Result;
