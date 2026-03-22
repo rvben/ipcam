@@ -8,8 +8,6 @@ pub struct Config {
     #[serde(default)]
     pub go2rtc: Option<Go2rtcConfig>,
     #[serde(default)]
-    pub frigate: Option<FrigateConfig>,
-    #[serde(default)]
     pub cameras: Vec<CameraConfig>,
 }
 
@@ -31,23 +29,6 @@ fn default_go2rtc_port() -> u16 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FrigateConfig {
-    pub host: String,
-    #[serde(default = "default_frigate_port")]
-    pub port: u16,
-}
-
-impl FrigateConfig {
-    pub fn base_url(&self) -> String {
-        format!("http://{}:{}", self.host, self.port)
-    }
-}
-
-fn default_frigate_port() -> u16 {
-    5001
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CameraConfig {
     pub name: String,
     #[serde(rename = "type")]
@@ -61,8 +42,6 @@ pub struct CameraConfig {
     pub go2rtc_stream: Option<String>,
     /// ONVIF port override (default: 2020 for Tapo, 8000 for Reolink)
     pub onvif_port: Option<u16>,
-    /// Frigate camera name (Frigate uses underscores, e.g. "front_door")
-    pub frigate_name: Option<String>,
     /// Custom RTSP main stream path (default varies by vendor)
     pub main_stream: Option<String>,
     /// Custom RTSP sub stream path (default varies by vendor)
@@ -116,13 +95,6 @@ impl CameraConfig {
         (username, password)
     }
 
-    /// Returns the Frigate camera name, falling back to the config name with
-    /// hyphens replaced by underscores.
-    pub fn frigate_name(&self) -> String {
-        self.frigate_name
-            .clone()
-            .unwrap_or_else(|| self.name.replace('-', "_"))
-    }
 }
 
 fn default_rtsp_port() -> u16 {
@@ -138,7 +110,6 @@ impl Config {
         if !path.exists() {
             return Ok(Self {
                 go2rtc: None,
-                frigate: None,
                 cameras: Vec::new(),
             });
         }
@@ -232,10 +203,6 @@ mod tests {
 host = "192.168.1.180"
 port = 8554
 
-[frigate]
-host = "192.168.1.180"
-port = 5001
-
 [[cameras]]
 name = "front-door"
 type = "reolink"
@@ -244,7 +211,6 @@ rtsp_port = 554
 username = "admin"
 password = "secret"
 onvif_port = 8000
-frigate_name = "front_door"
 
 [[cameras]]
 name = "kids-room"
@@ -266,7 +232,6 @@ go2rtc_stream = "kids_room"
             password: None,
             go2rtc_stream: None,
             onvif_port: None,
-            frigate_name: None,
             main_stream: None,
             sub_stream: None,
             onvif_username: None,
@@ -280,7 +245,6 @@ go2rtc_stream = "kids_room"
     fn parse_full_config() {
         let config: Config = toml::from_str(sample_config_toml()).unwrap();
         assert!(config.go2rtc.is_some());
-        assert!(config.frigate.is_some());
         assert_eq!(config.cameras.len(), 2);
     }
 
@@ -295,7 +259,6 @@ go2rtc_stream = "kids_room"
         assert_eq!(cam.username.as_deref(), Some("admin"));
         assert_eq!(cam.password.as_deref(), Some("secret"));
         assert_eq!(cam.onvif_port, Some(8000));
-        assert_eq!(cam.frigate_name.as_deref(), Some("front_door"));
     }
 
     #[test]
@@ -303,7 +266,6 @@ go2rtc_stream = "kids_room"
         let config: Config = toml::from_str(sample_config_toml()).unwrap();
         let cam = &config.cameras[1];
         assert_eq!(cam.onvif_port, None);
-        assert_eq!(cam.frigate_name, None);
         assert_eq!(cam.go2rtc_stream.as_deref(), Some("kids_room"));
     }
 
@@ -312,7 +274,6 @@ go2rtc_stream = "kids_room"
         let config: Config = toml::from_str("").unwrap();
         assert!(config.cameras.is_empty());
         assert!(config.go2rtc.is_none());
-        assert!(config.frigate.is_none());
     }
 
     #[test]
@@ -346,18 +307,6 @@ host = "10.0.0.1"
         )
         .unwrap();
         assert_eq!(config.go2rtc.unwrap().port, 8554);
-    }
-
-    #[test]
-    fn default_frigate_port_is_5001() {
-        let config: Config = toml::from_str(
-            r#"
-[frigate]
-host = "10.0.0.1"
-"#,
-        )
-        .unwrap();
-        assert_eq!(config.frigate.unwrap().port, 5001);
     }
 
     // --- onvif_port() ---
@@ -413,36 +362,6 @@ host = "10.0.0.1"
         let (user, pass) = cam.onvif_credentials();
         assert_eq!(user, "onvif_user");
         assert_eq!(pass, "rtsp_pass");
-    }
-
-    // --- frigate_name() ---
-
-    #[test]
-    fn frigate_name_from_explicit_field() {
-        let mut cam = make_camera(CameraType::Reolink);
-        cam.frigate_name = Some("custom_name".to_string());
-        assert_eq!(cam.frigate_name(), "custom_name");
-    }
-
-    #[test]
-    fn frigate_name_converts_hyphens_to_underscores() {
-        let cam = make_camera(CameraType::Reolink);
-        // name is "test-cam", should become "test_cam"
-        assert_eq!(cam.frigate_name(), "test_cam");
-    }
-
-    #[test]
-    fn frigate_name_no_hyphens_unchanged() {
-        let mut cam = make_camera(CameraType::Tapo);
-        cam.name = "backyard".to_string();
-        assert_eq!(cam.frigate_name(), "backyard");
-    }
-
-    #[test]
-    fn frigate_name_multiple_hyphens() {
-        let mut cam = make_camera(CameraType::Tapo);
-        cam.name = "front-door-left".to_string();
-        assert_eq!(cam.frigate_name(), "front_door_left");
     }
 
     // --- find_camera / require_camera ---
@@ -510,26 +429,6 @@ host = "10.0.0.1"
             go2rtc.rtsp_url("stream1"),
             "rtsp://10.0.0.5:9000/stream1"
         );
-    }
-
-    // --- FrigateConfig ---
-
-    #[test]
-    fn frigate_base_url() {
-        let frigate = FrigateConfig {
-            host: "192.168.1.180".to_string(),
-            port: 5001,
-        };
-        assert_eq!(frigate.base_url(), "http://192.168.1.180:5001");
-    }
-
-    #[test]
-    fn frigate_base_url_custom_port() {
-        let frigate = FrigateConfig {
-            host: "10.0.0.1".to_string(),
-            port: 8080,
-        };
-        assert_eq!(frigate.base_url(), "http://10.0.0.1:8080");
     }
 
     // --- config_path ---

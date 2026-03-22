@@ -232,7 +232,6 @@ mod tests {
             password: Some("pass".to_string()),
             go2rtc_stream: None,
             onvif_port: None,
-            frigate_name: None,
             main_stream: None,
             sub_stream: None,
             onvif_username: None,

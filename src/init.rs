@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use crate::config::{CameraConfig, CameraType, Config, FrigateConfig, Go2rtcConfig};
+use crate::config::{CameraConfig, CameraType, Config, Go2rtcConfig};
 use crate::discovery::{DiscoveredCamera, discover_cameras};
 
 // ── name generation ──────────────────────────────────────────────────────────
@@ -159,7 +159,6 @@ pub(crate) fn prompt_for_camera(cam: &DiscoveredCamera) -> Result<Option<CameraC
         },
         go2rtc_stream: None,
         onvif_port: None,
-        frigate_name: None,
         main_stream: None,
         sub_stream: None,
         onvif_username: None,
@@ -183,7 +182,6 @@ pub(crate) fn auto_camera_config(cam: &DiscoveredCamera) -> Option<CameraConfig>
         password: None,
         go2rtc_stream: None,
         onvif_port: None,
-        frigate_name: None,
         main_stream: None,
         sub_stream: None,
         onvif_username: None,
@@ -191,7 +189,7 @@ pub(crate) fn auto_camera_config(cam: &DiscoveredCamera) -> Option<CameraConfig>
     })
 }
 
-// ── go2rtc / Frigate prompts ──────────────────────────────────────────────────
+// ── go2rtc prompt ────────────────────────────────────────────────────────────
 
 fn prompt_go2rtc() -> Result<Option<Go2rtcConfig>> {
     println!();
@@ -204,19 +202,6 @@ fn prompt_go2rtc() -> Result<Option<Go2rtcConfig>> {
         .parse()
         .context("go2rtc port must be a number 1-65535")?;
     Ok(Some(Go2rtcConfig { host, port }))
-}
-
-fn prompt_frigate() -> Result<Option<FrigateConfig>> {
-    println!();
-    if !ask_yes_no("Do you have a Frigate NVR?", false)? {
-        return Ok(None);
-    }
-    let host = prompt_with_default("Frigate host", "localhost")?;
-    let port_str = prompt_with_default("Frigate port", "5001")?;
-    let port: u16 = port_str
-        .parse()
-        .context("Frigate port must be a number 1-65535")?;
-    Ok(Some(FrigateConfig { host, port }))
 }
 
 // ── config file writing ───────────────────────────────────────────────────────
@@ -252,9 +237,6 @@ fn print_summary(config: &Config, path: &std::path::Path) {
         println!("go2rtc: {}:{}", g.host, g.port);
     }
 
-    if let Some(f) = &config.frigate {
-        println!("Frigate: {}:{}", f.host, f.port);
-    }
 }
 
 // ── public entry points ───────────────────────────────────────────────────────
@@ -277,7 +259,7 @@ pub async fn run_init(auto: bool) -> Result<()> {
         }
     }
 
-    // First-time setup: discover cameras, then ask about go2rtc/Frigate.
+    // First-time setup: discover cameras, then ask about go2rtc.
     println!();
     println!("Scanning network for cameras (this may take a few seconds)...");
     let discovered = discover_cameras(Duration::from_secs(5), None).await?;
@@ -317,12 +299,10 @@ pub async fn run_init(auto: bool) -> Result<()> {
     }
 
     let go2rtc = if auto { None } else { prompt_go2rtc()? };
-    let frigate = if auto { None } else { prompt_frigate()? };
 
     let config = Config {
         cameras,
         go2rtc,
-        frigate,
     };
 
     write_config(&config, &config_path)?;

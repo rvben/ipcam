@@ -14,7 +14,6 @@ A command-line tool for managing IP cameras (Tapo, Reolink) via RTSP and vendor 
 - End-to-end camera test (network reachability, RTSP URL, snapshot)
 - Discover cameras on the local network via ONVIF WS-Discovery
 - Interactive `init` wizard that auto-discovers and configures cameras
-- Frigate NVR integration: list events and fetch latest snapshots
 - go2rtc restream proxy support for cameras behind a proxy
 - JSON output for every command (`--json`)
 - Shell completions for bash, zsh, and fish
@@ -81,10 +80,6 @@ Run `ipcam config` to print the exact path on your system.
 host = "192.168.1.10"
 port = 8554  # default
 
-[frigate]
-host = "192.168.1.11"
-port = 5001  # default
-
 [[cameras]]
 name = "front-door"
 type = "reolink"
@@ -104,8 +99,6 @@ rtsp_port = 554
 onvif_port = 2020
 # Optional: use a go2rtc restream instead of direct RTSP
 go2rtc_stream = "backyard"
-# Optional: Frigate camera name if it differs from the config name
-frigate_name = "backyard_cam"
 ```
 
 ### Config fields
@@ -120,7 +113,6 @@ frigate_name = "backyard_cam"
 | `rtsp_port` | no | RTSP port (default: 554) |
 | `onvif_port` | no | ONVIF port (default: 2020 for Tapo, 8000 for Reolink) |
 | `go2rtc_stream` | no | go2rtc stream name when using a restream proxy |
-| `frigate_name` | no | Frigate camera name (default: config `name` with `-` replaced by `_`) |
 
 ## Commands
 
@@ -145,8 +137,6 @@ frigate_name = "backyard_cam"
 | `events <camera>` | Show motion detection status; use `--watch` to poll continuously |
 | `ptz <camera> <action>` | Pan/tilt/zoom control: `left`, `right`, `up`, `down`, `stop`, `preset` |
 | `discover` | Scan the network for ONVIF cameras |
-| `frigate events` | List recent Frigate NVR events |
-| `frigate snapshot <camera>` | Fetch the latest snapshot from Frigate |
 | `add <host>` | Manually add a camera to the config |
 | `remove <name>` | Remove a camera from the config |
 | `rename <old> <new>` | Rename a camera in the config |
@@ -305,23 +295,6 @@ ipcam ptz backyard stop
 If your cameras are behind a [go2rtc](https://github.com/AlexxIT/go2rtc) restream proxy, add a `[go2rtc]` section to your config and set `go2rtc_stream` on each camera. ipcam will use the proxy RTSP URL (`rtsp://<host>:<port>/<stream>`) instead of connecting to the camera directly.
 
 Sub-stream URLs are constructed by appending `_sub` to the stream name (e.g. `backyard_sub`).
-
-### Frigate NVR
-
-Add a `[frigate]` section to your config pointing at your [Frigate](https://frigate.video) instance. Then use the `frigate` subcommand:
-
-```bash
-# List the 20 most recent events across all cameras
-ipcam frigate events --limit 20
-
-# Filter by camera
-ipcam frigate events --camera front_door
-
-# Save the latest Frigate snapshot for a camera
-ipcam frigate snapshot front_door --output /tmp/latest.jpg
-```
-
-Frigate camera names use underscores (e.g. `front_door`). Set `frigate_name` in the camera config if the name differs from your ipcam name.
 
 ## Credential Safety
 

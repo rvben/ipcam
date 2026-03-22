@@ -1,7 +1,6 @@
 mod camera;
 mod config;
 mod discovery;
-mod frigate;
 mod init;
 mod style;
 mod tui;
@@ -204,12 +203,6 @@ enum Command {
         camera: Option<String>,
     },
 
-    /// Interact with Frigate NVR
-    Frigate {
-        #[command(subcommand)]
-        action: FrigateAction,
-    },
-
     /// Control pan/tilt/zoom on a camera
     Ptz {
         /// Camera name from config
@@ -346,30 +339,6 @@ impl From<CameraTypeArg> for config::CameraType {
             CameraTypeArg::Reolink => config::CameraType::Reolink,
         }
     }
-}
-
-#[derive(Subcommand)]
-enum FrigateAction {
-    /// List recent events from Frigate
-    Events {
-        /// Filter by camera name
-        #[arg(short, long)]
-        camera: Option<String>,
-
-        /// Maximum number of events to return
-        #[arg(short, long, default_value = "10")]
-        limit: u32,
-    },
-
-    /// Save the latest snapshot from a Frigate camera
-    Snapshot {
-        /// Camera name (uses Frigate naming, e.g. front_door)
-        camera: String,
-
-        /// Output file path
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-    },
 }
 
 #[derive(Subcommand)]
@@ -601,7 +570,6 @@ async fn run_with(cli: Cli) -> Result<()> {
         }
         Command::Events { camera, watch } => cmd_events(&config, &camera, watch, cli.json).await,
         Command::Status { camera } => cmd_status(&config, camera.as_deref(), cli.json).await,
-        Command::Frigate { action } => cmd_frigate(&config, action, cli.json).await,
         Command::Ptz {
             camera,
             action,
@@ -1908,67 +1876,6 @@ async fn cmd_watch(
     Ok(())
 }
 
-async fn cmd_frigate(config: &config::Config, action: FrigateAction, json: bool) -> Result<()> {
-    let frigate_config = config
-        .frigate
-        .as_ref()
-        .context("no [frigate] section in config file")?;
-    let client = frigate::FrigateClient::new(frigate_config);
-
-    match action {
-        FrigateAction::Events { camera, limit } => {
-            // If user passes a ipcam name, resolve its frigate_name
-            let frigate_camera = camera.as_ref().map(|name| {
-                config
-                    .find_camera(name)
-                    .map(|c| c.frigate_name())
-                    .unwrap_or_else(|| name.clone())
-            });
-
-            let events = client.events(frigate_camera.as_deref(), limit).await?;
-
-            if json {
-                println!("{}", serde_json::to_string_pretty(&events)?);
-            } else {
-                if events.is_empty() {
-                    println!("No events found.");
-                    return Ok(());
-                }
-                println!(
-                    "{:<24} {:<18} {:<12} {:<8}",
-                    "TIME", "CAMERA", "LABEL", "SCORE"
-                );
-                println!("{}", "-".repeat(64));
-                for event in &events {
-                    let ts = chrono::DateTime::from_timestamp(event.start_time as i64, 0)
-                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                        .unwrap_or_else(|| format!("{:.0}", event.start_time));
-                    let score = event
-                        .score
-                        .map(|s| format!("{:.0}%", s * 100.0))
-                        .unwrap_or_else(|| "-".to_string());
-                    println!(
-                        "{:<24} {:<18} {:<12} {:<8}",
-                        ts, event.camera, event.label, score,
-                    );
-                }
-            }
-        }
-        FrigateAction::Snapshot { camera, output } => {
-            // If user passes a ipcam name, resolve its frigate_name
-            let frigate_camera = config
-                .find_camera(&camera)
-                .map(|c| c.frigate_name())
-                .unwrap_or_else(|| camera.clone());
-
-            let path = client.snapshot(&frigate_camera, output).await?;
-            println!("Saved Frigate snapshot to {}", path.display());
-        }
-    }
-
-    Ok(())
-}
-
 fn cmd_config_path(json: bool) -> Result<()> {
     let path = config::Config::config_path()?;
     if json {
@@ -2408,7 +2315,6 @@ fn cmd_add_direct(
         password: password.map(|p| p.to_string()),
         go2rtc_stream: go2rtc_stream.map(|s| s.to_string()),
         onvif_port: None,
-        frigate_name: None,
         main_stream: None,
         sub_stream: None,
         onvif_username: None,
@@ -2684,14 +2590,6 @@ fn cmd_rename(old_name: &str, new_name: &str, config_path: Option<&Path>, json: 
         updated_go2rtc = true;
     }
 
-    let mut updated_frigate = false;
-    if let Some(ref fname) = cam.frigate_name.clone()
-        && *fname == old_auto
-    {
-        cam.frigate_name = Some(new_auto.clone());
-        updated_frigate = true;
-    }
-
     let path = config::Config::config_path()?;
     let content = toml::to_string_pretty(&config).context("serializing config")?;
     std::fs::write(&path, content)
@@ -2705,16 +2603,12 @@ fn cmd_rename(old_name: &str, new_name: &str, config_path: Option<&Path>, json: 
                 "old_name": old_name,
                 "new_name": new_name,
                 "updated_go2rtc": updated_go2rtc,
-                "updated_frigate": updated_frigate,
             })
         );
     } else {
         println!("Renamed camera '{}' -> '{}'", old_name, new_name);
         if updated_go2rtc {
             println!("  go2rtc_stream: '{}' -> '{}'", old_auto, new_auto);
-        }
-        if updated_frigate {
-            println!("  frigate_name:  '{}' -> '{}'", old_auto, new_auto);
         }
     }
 
