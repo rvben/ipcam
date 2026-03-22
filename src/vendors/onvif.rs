@@ -2,8 +2,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 
 use crate::camera::{
-    Camera, CameraInfo, HealthStatus, ImageFormat, MotionStatus, PtzDirection, Snapshot,
-    StreamQuality,
+    Camera, CameraInfo, HealthStatus, MotionStatus, PtzDirection, Snapshot, StreamQuality,
 };
 use crate::config::{CameraConfig, Go2rtcConfig};
 use crate::discovery::extract_xml_elements;
@@ -123,44 +122,16 @@ impl Camera for OnvifCamera {
 
     async fn snapshot(&self) -> Result<Snapshot> {
         let rtsp_url = self.effective_rtsp_url(StreamQuality::Sub);
-        let tmp = std::env::temp_dir().join(format!("ipcam-{}.jpg", self.name));
-
-        let output = tokio::process::Command::new("ffmpeg")
-            .args([
-                "-rtsp_transport",
-                "tcp",
-                "-i",
-                &rtsp_url,
-                "-frames:v",
-                "1",
-                "-update",
-                "1",
-                "-y",
-            ])
-            .arg(&tmp)
-            .output()
-            .await
-            .context("failed to run ffmpeg — is it installed?")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!(
-                "ffmpeg snapshot failed for camera '{}' at {}: {}",
-                self.name,
-                self.host,
-                stderr.lines().last().unwrap_or("unknown error")
-            );
-        }
-
-        let data = std::fs::read(&tmp)?;
-        let _ = std::fs::remove_file(&tmp);
-
-        Ok(Snapshot {
-            camera_name: self.name.clone(),
-            timestamp: chrono::Utc::now(),
-            data,
-            format: ImageFormat::Jpeg,
-        })
+        soap::snapshot_with_fallback(
+            &self.client,
+            &self.name,
+            &self.host,
+            self.onvif_port,
+            &self.username,
+            &self.password,
+            &rtsp_url,
+        )
+        .await
     }
 
     fn rtsp_url(&self, quality: StreamQuality) -> String {

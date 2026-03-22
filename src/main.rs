@@ -382,6 +382,9 @@ enum ConfigAction {
 
     /// Print the current config with passwords masked
     Show,
+
+    /// Validate the config and check camera connectivity
+    Check,
 }
 
 #[tokio::main]
@@ -581,6 +584,7 @@ async fn run_with(cli: Cli) -> Result<()> {
             ConfigAction::Path => cmd_config_path(cli.json),
             ConfigAction::Edit => cmd_config_edit(),
             ConfigAction::Show => cmd_config_show(cli.json, cli.config.as_deref()),
+            ConfigAction::Check => cmd_config_check(&config, cli.json).await,
         },
         Command::Discover {
             timeout,
@@ -2016,6 +2020,116 @@ fn cmd_config_edit() -> Result<()> {
     if !status.success() {
         anyhow::bail!("editor '{editor}' exited with status {status}");
     }
+    Ok(())
+}
+
+async fn cmd_config_check(config: &config::Config, json: bool) -> Result<()> {
+    let mut warnings: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    if config.cameras.is_empty() {
+        errors.push("no cameras configured".to_string());
+    }
+
+    // Check for duplicate camera names
+    let mut seen_names = std::collections::HashSet::new();
+    for cam in &config.cameras {
+        if !seen_names.insert(&cam.name) {
+            errors.push(format!("duplicate camera name: '{}'", cam.name));
+        }
+    }
+
+    // Check for duplicate hosts
+    let mut seen_hosts: std::collections::HashMap<&str, &str> =
+        std::collections::HashMap::new();
+    for cam in &config.cameras {
+        if let Some(first_name) = seen_hosts.get(cam.host.as_str()) {
+            warnings.push(format!(
+                "duplicate host '{}' (cameras '{}' and '{}')",
+                cam.host, first_name, cam.name
+            ));
+        } else {
+            seen_hosts.insert(&cam.host, &cam.name);
+        }
+    }
+
+    // Per-camera checks
+    for cam in &config.cameras {
+        if cam.username.is_none() || cam.username.as_deref() == Some("") {
+            warnings.push(format!("camera '{}': no username set", cam.name));
+        }
+        if cam.password.is_none() || cam.password.as_deref() == Some("") {
+            warnings.push(format!("camera '{}': no password set", cam.name));
+        }
+        if cam.rtsp_port == 0 {
+            errors.push(format!("camera '{}': invalid RTSP port 0", cam.name));
+        }
+        if cam.onvif_port == Some(0) {
+            errors.push(format!("camera '{}': invalid ONVIF port 0", cam.name));
+        }
+        if cam.host.is_empty() {
+            errors.push(format!("camera '{}': empty host", cam.name));
+        }
+    }
+
+    // Check go2rtc references
+    if config.go2rtc.is_none() {
+        let has_go2rtc_stream = config.cameras.iter().any(|c| c.go2rtc_stream.is_some());
+        if has_go2rtc_stream {
+            errors.push(
+                "cameras reference go2rtc_stream but no [go2rtc] section is configured".to_string(),
+            );
+        }
+    }
+
+    if json {
+        let valid = errors.is_empty();
+        println!(
+            "{}",
+            serde_json::json!({
+                "valid": valid,
+                "errors": errors,
+                "warnings": warnings,
+                "cameras": config.cameras.len(),
+            })
+        );
+        if !valid {
+            std::process::exit(1);
+        }
+    } else {
+        let path = config::Config::config_path()?;
+        println!("{}", style::bold(&format!("Config: {}", path.display())));
+        println!(
+            "Cameras: {}",
+            config.cameras.len()
+        );
+        println!();
+
+        if errors.is_empty() && warnings.is_empty() {
+            println!("{}", style::green("No issues found."));
+        }
+
+        for e in &errors {
+            println!("  {} {}", style::red("error:"), e);
+        }
+        for w in &warnings {
+            println!("  {} {}", style::bold("warning:"), w);
+        }
+
+        if !errors.is_empty() {
+            println!();
+            println!(
+                "{} error(s), {} warning(s)",
+                style::red(&errors.len().to_string()),
+                warnings.len()
+            );
+            std::process::exit(1);
+        } else if !warnings.is_empty() {
+            println!();
+            println!("0 errors, {} warning(s)", warnings.len());
+        }
+    }
+
     Ok(())
 }
 
