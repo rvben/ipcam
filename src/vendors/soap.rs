@@ -79,30 +79,10 @@ pub async fn send_ptz_soap(
 
 use anyhow::Context;
 
-/// Query model name via ONVIF GetDeviceInformation (with digest auth).
-/// Returns "manufacturer model" string, or None on failure.
-pub async fn query_model_name(
-    client: &reqwest::Client,
-    device_service_url: &str,
-    username: &str,
-    password: &str,
-) -> Option<String> {
-    let body = soap_envelope(
-        username,
-        password,
-        r#"<tds:GetDeviceInformation xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>"#,
-    );
-    let resp = client
-        .post(device_service_url)
-        .header("Content-Type", "application/soap+xml; charset=utf-8")
-        .body(body)
-        .timeout(Duration::from_secs(2))
-        .send()
-        .await
-        .ok()?;
-    let xml = resp.text().await.ok()?;
-    let model = extract_xml_elements(&xml, "Model").into_iter().next()?;
-    let mfr = extract_xml_elements(&xml, "Manufacturer")
+/// Try to extract "manufacturer model" from an ONVIF GetDeviceInformation response.
+fn parse_device_info(xml: &str) -> Option<String> {
+    let model = extract_xml_elements(xml, "Model").into_iter().next()?;
+    let mfr = extract_xml_elements(xml, "Manufacturer")
         .into_iter()
         .next()
         .unwrap_or_default();
@@ -113,8 +93,57 @@ pub async fn query_model_name(
     }
 }
 
+/// Query model name via ONVIF GetDeviceInformation.
+/// Tries authenticated first, then unauthenticated as fallback.
+pub async fn query_model_name(
+    client: &reqwest::Client,
+    device_service_url: &str,
+    username: &str,
+    password: &str,
+) -> Option<String> {
+    let get_device_info =
+        r#"<tds:GetDeviceInformation xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>"#;
+
+    // Try with digest auth first
+    let auth_body = soap_envelope(username, password, get_device_info);
+    if let Some(result) = send_and_parse_device_info(client, device_service_url, &auth_body).await {
+        return Some(result);
+    }
+
+    // Fall back to unauthenticated
+    let unauth_body = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+            xmlns:tds="http://www.onvif.org/ver10/device/wsdl">
+  <s:Body>
+    {get_device_info}
+  </s:Body>
+</s:Envelope>"#
+    );
+    send_and_parse_device_info(client, device_service_url, &unauth_body).await
+}
+
+async fn send_and_parse_device_info(
+    client: &reqwest::Client,
+    url: &str,
+    body: &str,
+) -> Option<String> {
+    let resp = client
+        .post(url)
+        .header("Content-Type", "application/soap+xml; charset=utf-8")
+        .body(body.to_string())
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .ok()?;
+    let xml = resp.text().await.ok()?;
+    parse_device_info(&xml)
+}
+
 /// Check camera reachability via TCP connect to RTSP port, then try to get
 /// the model name via ONVIF for a richer status detail.
+///
+/// `fallback_label` is shown when ONVIF model query fails (e.g. camera type name).
 pub async fn check_reachable(
     client: &reqwest::Client,
     host: &str,
@@ -122,6 +151,7 @@ pub async fn check_reachable(
     device_service_url: &str,
     username: &str,
     password: &str,
+    fallback_label: &str,
 ) -> HealthStatus {
     let start = Instant::now();
     let addr = format!("{}:{}", host, rtsp_port);
@@ -130,7 +160,7 @@ pub async fn check_reachable(
         Ok(Ok(_)) => {
             let detail = query_model_name(client, device_service_url, username, password)
                 .await
-                .unwrap_or(addr);
+                .unwrap_or_else(|| fallback_label.to_string());
             HealthStatus {
                 online: true,
                 detail,

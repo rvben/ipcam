@@ -179,6 +179,7 @@ impl Camera for OnvifCamera {
             &self.device_service_url(),
             &self.username,
             &self.password,
+            "ONVIF",
         )
         .await
     }

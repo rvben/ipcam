@@ -139,6 +139,7 @@ impl Camera for TapoCamera {
             &self.device_service_url(),
             &self.username,
             &self.password,
+            "Tapo",
         )
         .await
     }
