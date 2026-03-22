@@ -3,6 +3,7 @@ mod config;
 mod discovery;
 mod frigate;
 mod init;
+mod style;
 mod tui;
 mod vendors;
 
@@ -652,6 +653,11 @@ fn cmd_list(config: &config::Config, json: bool) -> Result<()> {
             .collect();
         println!("{}", serde_json::to_string_pretty(&cameras)?);
     } else {
+        println!(
+            "{}",
+            style::bold(&format!("{:<20} {:<10} {}", "CAMERA", "TYPE", "HOST"))
+        );
+        println!("{}", style::dim(&"-".repeat(50)));
         for cam in &config.cameras {
             println!("{:<20} {:<10} {}", cam.name, cam.camera_type, cam.host);
         }
@@ -1558,10 +1564,13 @@ async fn cmd_discover(
     }
 
     println!(
-        "{:<18} {:<20} {:<20} ONVIF URL",
-        "ADDRESS", "MANUFACTURER", "MODEL"
+        "{}",
+        style::bold(&format!(
+            "{:<18} {:<20} {:<20} {}",
+            "ADDRESS", "MANUFACTURER", "MODEL", "ONVIF URL"
+        ))
     );
-    println!("{}", "-".repeat(90));
+    println!("{}", style::dim(&"-".repeat(90)));
 
     for cam in &cameras {
         println!(
@@ -1714,14 +1723,35 @@ async fn cmd_status(config: &config::Config, camera: Option<&str>, json: bool) -
             .collect();
         println!("{}", serde_json::to_string_pretty(&entries)?);
     } else {
+        println!(
+            "{}",
+            style::bold(&format!(
+                "{:<20} {:<10} {:<30} {}",
+                "CAMERA", "STATUS", "MODEL", "LATENCY"
+            ))
+        );
+        println!("{}", style::dim(&"-".repeat(70)));
         for (name, status) in &results {
-            let state = if status.online { "online" } else { "offline" };
+            let state_raw = if status.online { "online" } else { "offline" };
+            let state = if status.online {
+                style::green(state_raw)
+            } else {
+                style::red(state_raw)
+            };
+            let latency_raw = format!("{}ms", status.latency.as_millis());
+            // Pad columns manually to avoid ANSI codes breaking alignment
+            let pad_state = 10_usize.saturating_sub(state_raw.len());
+            let pad_detail = 30_usize.saturating_sub(status.detail.len());
             println!(
-                "{:<20} {:<8} ({}, {}ms)",
+                "{:<20} {}{:pad_s$} {}{:pad_d$} {}",
                 name,
                 state,
+                "",
                 status.detail,
-                status.latency.as_millis(),
+                "",
+                style::dim(&latency_raw),
+                pad_s = pad_state,
+                pad_d = pad_detail,
             );
         }
     }
@@ -1791,10 +1821,14 @@ async fn cmd_watch(
     for (name, _host, status) in &initial {
         let now = chrono::Local::now();
         let ts = now.format("%Y-%m-%d %H:%M:%S");
-        let state = if status.online { "online" } else { "offline" };
+        let state = if status.online {
+            style::green("online")
+        } else {
+            style::red("offline")
+        };
         println!(
-            "[{}] {}: {} ({}, {}ms)",
-            ts,
+            "{} {}: {} ({}, {}ms)",
+            style::dim(&format!("[{ts}]")),
             name,
             state,
             status.detail,
@@ -1818,15 +1852,19 @@ async fn cmd_watch(
                     if changed {
                         let now = chrono::Local::now();
                         let ts = now.format("%Y-%m-%d %H:%M:%S");
-                        let state = if status.online { "online" } else { "offline" };
+                        let state = if status.online {
+                            style::green("online")
+                        } else {
+                            style::red("offline")
+                        };
                         let annotation = match prev {
                             Some(false) => " ← back online",
                             Some(true)  => " ← went offline",
                             None        => "",
                         };
                         println!(
-                            "[{}] {}: {}{} ({}, {}ms)",
-                            ts,
+                            "{} {}: {}{} ({}, {}ms)",
+                            style::dim(&format!("[{ts}]")),
                             name,
                             state,
                             annotation,
