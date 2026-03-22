@@ -59,10 +59,15 @@ struct App {
     grabber: Option<FrameGrabber>,
     health_rx: tokio::sync::mpsc::Receiver<Vec<HealthStatus>>,
     health_pending: bool,
+    status_message: Option<(String, Instant)>,
+    status_tx: tokio::sync::mpsc::Sender<String>,
+    status_rx: tokio::sync::mpsc::Receiver<String>,
+    player: Option<std::process::Child>,
 }
 
 impl App {
     fn new(health_rx: tokio::sync::mpsc::Receiver<Vec<HealthStatus>>) -> Self {
+        let (status_tx, status_rx) = tokio::sync::mpsc::channel(4);
         Self {
             cameras: Vec::new(),
             table_state: TableState::default(),
@@ -73,7 +78,25 @@ impl App {
             grabber: None,
             health_rx,
             health_pending: false,
+            status_message: None,
+            status_tx,
+            status_rx,
+            player: None,
         }
+    }
+
+    fn set_status(&mut self, msg: String) {
+        self.status_message = Some((msg, Instant::now()));
+    }
+
+    fn active_status(&self) -> Option<&str> {
+        self.status_message.as_ref().and_then(|(msg, when)| {
+            if when.elapsed() < Duration::from_secs(5) {
+                Some(msg.as_str())
+            } else {
+                None
+            }
+        })
     }
 
     fn update_counts(&mut self) {
@@ -89,6 +112,10 @@ impl App {
             self.last_refresh = Instant::now();
             self.update_counts();
             self.health_pending = false;
+        }
+        // Check for status messages from background tasks (snapshot, etc.)
+        while let Ok(msg) = self.status_rx.try_recv() {
+            self.set_status(msg);
         }
     }
 
@@ -249,7 +276,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
                 vec![
                     Constraint::Length(1),
                     Constraint::Min(5),
-                    Constraint::Length(6),
+                    Constraint::Length(7),
                     Constraint::Length(1),
                 ]
             } else {
@@ -266,7 +293,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
         let elapsed = app.last_refresh.elapsed().as_secs();
         let total = app.cameras.len();
         let online = app.online_count;
-        let header = Line::from(vec![
+        let mut header_spans = vec![
             Span::styled(
                 " ipcam ",
                 Style::default()
@@ -285,7 +312,15 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
                 format!("  {}s ago", elapsed),
                 Style::default().fg(Color::DarkGray),
             ),
-        ]);
+        ];
+        if let Some(msg) = app.active_status() {
+            header_spans.push(Span::raw("  "));
+            header_spans.push(Span::styled(
+                msg,
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+        let header = Line::from(header_spans);
         frame.render_widget(Paragraph::new(header), main_chunks[0]);
 
         // Camera table
@@ -352,7 +387,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
             } else {
                 Color::Red
             };
-            let details = vec![
+            let mut details = vec![
                 Line::from(vec![
                     Span::styled("  Host: ", Style::default().fg(Color::DarkGray)),
                     Span::raw(&cam.host),
@@ -363,18 +398,29 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
                     Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(status_label, Style::default().fg(status_color)),
                 ]),
-                Line::from(vec![
-                    Span::styled("  RTSP: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(crate::redact_url(&cam.rtsp_url)),
-                ]),
-                Line::from(vec![
-                    Span::styled("  ONVIF: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(format!("{}:{}", cam.host, cam.onvif_port)),
+            ];
+            if cam.status.online {
+                details.push(Line::from(vec![
+                    Span::styled("  Detail: ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(&cam.status.detail),
                     Span::raw("    "),
                     Span::styled("Latency: ", Style::default().fg(Color::DarkGray)),
                     Span::raw(format!("{}ms", cam.status.latency.as_millis())),
-                ]),
-            ];
+                ]));
+            } else {
+                details.push(Line::from(vec![
+                    Span::styled("  Detail: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(&cam.status.detail, Style::default().fg(Color::Red)),
+                ]));
+            }
+            details.push(Line::from(vec![
+                Span::styled("  RTSP: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(crate::redact_url(&cam.rtsp_url)),
+            ]));
+            details.push(Line::from(vec![
+                Span::styled("  ONVIF: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{}:{}", cam.host, cam.onvif_port)),
+            ]));
             let detail_block = Paragraph::new(details).block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -391,12 +437,16 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
             Span::raw(" refresh  "),
             Span::styled("j/k", Style::default().fg(Color::Yellow)),
             Span::raw(" navigate  "),
+            Span::styled("s", Style::default().fg(Color::Yellow)),
+            Span::raw(" snapshot  "),
+            Span::styled("o", Style::default().fg(Color::Yellow)),
+            Span::raw(" open stream  "),
             Span::styled("Enter", Style::default().fg(Color::Yellow)),
         ];
         if app.preview_camera.is_some() {
             footer_spans.push(Span::raw(" close preview"));
         } else {
-            footer_spans.push(Span::raw(" live preview"));
+            footer_spans.push(Span::raw(" preview"));
         }
         frame.render_widget(Paragraph::new(Line::from(footer_spans)), main_chunks[3]);
 
@@ -535,6 +585,112 @@ pub async fn run_tui(config: &Config, interval: u64) -> Result<()> {
                 }
                 KeyCode::Down | KeyCode::Char('j') => app.next(),
                 KeyCode::Up | KeyCode::Char('k') => app.previous(),
+                KeyCode::Char('s') => {
+                    if let Some(idx) = app.table_state.selected() {
+                        let cam = &app.cameras[idx];
+                        if !cam.status.online {
+                            app.set_status(format!("'{}' is offline", cam.name));
+                        } else {
+                            let name = cam.name.clone();
+                            let cam_config = config.cameras.get(idx).cloned();
+                            let go2rtc = config.go2rtc.clone();
+                            let tx = app.status_tx.clone();
+                            tokio::spawn(async move {
+                                if let Some(cfg) = cam_config {
+                                    match vendors::create_camera(&cfg, go2rtc.as_ref()) {
+                                        Ok(c) => match c.snapshot().await {
+                                            Ok(snap) => {
+                                                let ts =
+                                                    chrono::Utc::now().format("%Y%m%d_%H%M%S");
+                                                let filename = format!(
+                                                    "{}_{}.{}",
+                                                    name,
+                                                    ts,
+                                                    snap.format.extension()
+                                                );
+                                                match std::fs::write(&filename, &snap.data) {
+                                                    Ok(()) => {
+                                                        let _ = tx
+                                                            .send(format!("Saved {}", filename))
+                                                            .await;
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = tx
+                                                            .send(format!(
+                                                                "Write failed: {}",
+                                                                e
+                                                            ))
+                                                            .await;
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                let _ = tx
+                                                    .send(format!("Snapshot failed: {}", e))
+                                                    .await;
+                                            }
+                                        },
+                                        Err(e) => {
+                                            let _ =
+                                                tx.send(format!("Camera error: {}", e)).await;
+                                        }
+                                    }
+                                }
+                            });
+                            app.set_status(format!("Saving snapshot from '{}'...", cam.name));
+                        }
+                    }
+                }
+                KeyCode::Char('o') => {
+                    if let Some(cam) = app.selected_camera() {
+                        if !cam.status.online {
+                            app.set_status(format!("'{}' is offline", cam.name));
+                        } else if cam.rtsp_url.is_empty() {
+                            app.set_status(format!("No RTSP URL for '{}'", cam.name));
+                        } else {
+                            let url = cam.rtsp_url.clone();
+                            let cam_name = cam.name.clone();
+                            // Kill any existing player before spawning a new one
+                            if let Some(mut child) = app.player.take() {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                            }
+                            // Try common players in order of preference
+                            let opened = std::process::Command::new("mpv")
+                                .arg(&url)
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
+                                .spawn()
+                                .or_else(|_| {
+                                    std::process::Command::new("vlc")
+                                        .arg(&url)
+                                        .stdout(std::process::Stdio::null())
+                                        .stderr(std::process::Stdio::null())
+                                        .spawn()
+                                })
+                                .or_else(|_| {
+                                    std::process::Command::new("ffplay")
+                                        .arg(&url)
+                                        .stdout(std::process::Stdio::null())
+                                        .stderr(std::process::Stdio::null())
+                                        .spawn()
+                                });
+                            match opened {
+                                Ok(child) => {
+                                    app.player = Some(child);
+                                    app.set_status(format!(
+                                        "Opened stream for '{}'",
+                                        cam_name
+                                    ));
+                                }
+                                Err(_) => app.set_status(
+                                    "No player found (install mpv, vlc, or ffplay)"
+                                        .to_string(),
+                                ),
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
             // Force full redraw when preview changed (closed or switched camera)
@@ -554,6 +710,10 @@ pub async fn run_tui(config: &Config, interval: u64) -> Result<()> {
     }
 
     app.close_preview();
+    if let Some(mut child) = app.player.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
     restore_terminal();
     Ok(())
 }
