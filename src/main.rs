@@ -182,9 +182,9 @@ enum Command {
         #[arg(long)]
         no_add: bool,
 
-        /// Scan a specific subnet via TCP probes (e.g. 10.10.20.0/24)
+        /// Scan specific subnet(s) via TCP probes (e.g. 10.10.20.0/24). Can be repeated.
         #[arg(long)]
-        subnet: Option<String>,
+        subnet: Vec<String>,
     },
 
     /// Watch for motion and doorbell events
@@ -586,10 +586,11 @@ async fn run_with(cli: Cli) -> Result<()> {
             no_add,
             subnet,
         } => {
+            let subnets: Vec<&str> = subnet.iter().map(|s| s.as_str()).collect();
             if no_add {
-                cmd_discover(timeout, cli.json, &config, subnet.as_deref()).await
+                cmd_discover(timeout, cli.json, &config, &subnets).await
             } else {
-                cmd_add_discover(&config, cli.config.as_deref(), cli.json, timeout, subnet.as_deref())
+                cmd_add_discover(&config, cli.config.as_deref(), cli.json, timeout, &subnets)
                     .await
             }
         }
@@ -1526,12 +1527,12 @@ async fn cmd_discover(
     timeout: u64,
     json: bool,
     config: &config::Config,
-    subnet: Option<&str>,
+    subnets: &[&str],
 ) -> Result<()> {
     let mut cameras =
         discovery::discover_cameras(Duration::from_secs(timeout), Some(config)).await?;
 
-    if let Some(cidr) = subnet {
+    for cidr in subnets {
         if !json {
             println!("Scanning subnet {}...", cidr);
         }
@@ -2293,7 +2294,7 @@ async fn cmd_add_discover(
     config_path: Option<&Path>,
     json: bool,
     timeout: u64,
-    subnet: Option<&str>,
+    subnets: &[&str],
 ) -> Result<()> {
     use crate::discovery::{discover_cameras, scan_subnet};
     use crate::init::{auto_camera_config, infer_camera_type, prompt_for_camera};
@@ -2308,7 +2309,7 @@ async fn cmd_add_discover(
     let mut discovered =
         discover_cameras(Duration::from_secs(timeout), Some(config)).await?;
 
-    if let Some(cidr) = subnet {
+    for cidr in subnets {
         if !json {
             println!("Scanning subnet {}...", cidr);
         }

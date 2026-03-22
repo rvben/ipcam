@@ -258,58 +258,42 @@ fn print_summary(config: &Config, path: &std::path::Path) {
 pub async fn run_init(auto: bool) -> Result<()> {
     let config_path = Config::config_path()?;
 
-    // Check if config already exists.
-    let mut existing_cameras: Vec<CameraConfig> = Vec::new();
-    let mut existing_go2rtc: Option<Go2rtcConfig> = None;
-    let mut existing_frigate: Option<FrigateConfig> = None;
-
     if config_path.exists() {
         println!("Config already exists at: {}", config_path.display());
-
         if auto {
-            // In auto mode silently overwrite.
-        } else {
-            let overwrite = ask_yes_no("Overwrite?", false)?;
-            if !overwrite {
-                // Offer to append cameras to existing config instead.
-                let append = ask_yes_no("Append discovered cameras to existing config?", true)?;
-                if !append {
-                    println!("Aborted.");
-                    return Ok(());
-                }
-                // Load existing config so we can append to it.
-                let existing = Config::load(None)?;
-                existing_cameras = existing.cameras;
-                existing_go2rtc = existing.go2rtc;
-                existing_frigate = existing.frigate;
-            }
+            println!("Use `ipcam discover` to find and add new cameras.");
+            return Ok(());
+        }
+        let overwrite = ask_yes_no("Start fresh? (No = use `ipcam discover` to add cameras)", false)?;
+        if !overwrite {
+            println!();
+            println!("To add new cameras: ipcam discover");
+            println!("To add cameras on a VLAN: ipcam discover --subnet 10.10.20.0/24");
+            return Ok(());
         }
     }
 
-    // Run ONVIF discovery.
+    // First-time setup: discover cameras, then ask about go2rtc/Frigate.
     println!();
     println!("Scanning network for cameras (this may take a few seconds)...");
     let discovered = discover_cameras(Duration::from_secs(5), None).await?;
 
     if discovered.is_empty() {
         println!("No cameras found on the network.");
-        if !auto {
-            println!("You can add cameras manually to: {}", config_path.display());
-        }
-        return Ok(());
+        println!("You can add cameras manually: ipcam add --host <IP> --type <tapo|reolink>");
+        println!("Or scan a specific subnet: ipcam discover --subnet 10.10.20.0/24");
+    } else {
+        println!("Found {} camera(s) on the network.", discovered.len());
     }
 
-    println!("Found {} camera(s) on the network.", discovered.len());
-
-    let mut new_cameras: Vec<CameraConfig> = Vec::new();
+    let mut cameras: Vec<CameraConfig> = Vec::new();
 
     if auto {
-        // Auto mode: add all cameras we can infer a type for.
         for cam in &discovered {
             match auto_camera_config(cam) {
                 Some(c) => {
                     println!("  + {} ({}) at {}", c.name, c.camera_type, cam.address);
-                    new_cameras.push(c);
+                    cameras.push(c);
                 }
                 None => {
                     println!(
@@ -321,42 +305,15 @@ pub async fn run_init(auto: bool) -> Result<()> {
             }
         }
     } else {
-        // Interactive mode: ask about each camera.
         for cam in &discovered {
             if let Some(c) = prompt_for_camera(cam)? {
-                new_cameras.push(c);
+                cameras.push(c);
             }
         }
     }
 
-    // Merge with existing cameras (avoid duplicates by host).
-    let existing_hosts: std::collections::HashSet<String> =
-        existing_cameras.iter().map(|c| c.host.clone()).collect();
-
-    let mut cameras = existing_cameras;
-    for cam in new_cameras {
-        if existing_hosts.contains(&cam.host) {
-            println!(
-                "Skipping {} (host {} already configured).",
-                cam.name, cam.host
-            );
-        } else {
-            cameras.push(cam);
-        }
-    }
-
-    // Ask about go2rtc / Frigate (interactive only; skip in auto mode).
-    let go2rtc = if auto {
-        existing_go2rtc
-    } else {
-        prompt_go2rtc()?.or(existing_go2rtc)
-    };
-
-    let frigate = if auto {
-        existing_frigate
-    } else {
-        prompt_frigate()?.or(existing_frigate)
-    };
+    let go2rtc = if auto { None } else { prompt_go2rtc()? };
+    let frigate = if auto { None } else { prompt_frigate()? };
 
     let config = Config {
         cameras,

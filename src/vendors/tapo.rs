@@ -107,6 +107,36 @@ impl TapoCamera {
         Ok(())
     }
 
+    /// Query model name via ONVIF GetDeviceInformation (with auth).
+    async fn query_model_name(&self) -> Option<String> {
+        let url = format!("http://{}:{}/onvif/device_service", self.host, self.onvif_port);
+        let body = self.soap_envelope(
+            r#"<tds:GetDeviceInformation xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>"#,
+        );
+        let resp = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/soap+xml; charset=utf-8")
+            .body(body)
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+            .ok()?;
+        let xml = resp.text().await.ok()?;
+        let model = crate::discovery::extract_xml_elements(&xml, "Model")
+            .into_iter()
+            .next()?;
+        let mfr = crate::discovery::extract_xml_elements(&xml, "Manufacturer")
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        if mfr.is_empty() {
+            Some(model)
+        } else {
+            Some(format!("{} {}", mfr, model))
+        }
+    }
+
     fn effective_rtsp_url(&self, quality: StreamQuality) -> String {
         if let (Some(stream), Some(go2rtc)) = (&self.go2rtc_stream, &self.go2rtc) {
             let suffix = match quality {
@@ -197,11 +227,15 @@ impl Camera for TapoCamera {
         )
         .await
         {
-            Ok(Ok(_)) => HealthStatus {
-                online: true,
-                detail: addr,
-                latency: start.elapsed(),
-            },
+            Ok(Ok(_)) => {
+                // Try to get model name via ONVIF for a richer status detail
+                let detail = self.query_model_name().await.unwrap_or(addr);
+                HealthStatus {
+                    online: true,
+                    detail,
+                    latency: start.elapsed(),
+                }
+            }
             Ok(Err(e)) => HealthStatus {
                 online: false,
                 detail: e.to_string(),
