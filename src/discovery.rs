@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use base64::Engine;
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -408,6 +408,105 @@ async fn get_device_info(
     send_device_info_request(client, onvif_url, &digest_body).await
 }
 
+/// Check if a response body looks like ONVIF SOAP XML.
+/// Checks for SOAP namespaces or ONVIF-specific content.
+fn looks_like_onvif_soap(body: &str) -> bool {
+    // SOAP 1.1 namespace
+    body.contains("schemas.xmlsoap.org")
+        // SOAP 1.2 namespace
+        || body.contains("www.w3.org/2003/05/soap-envelope")
+        // ONVIF namespace
+        || body.contains("www.onvif.org")
+}
+
+/// Probe a single ONVIF endpoint: verify it's actually ONVIF, and try to get
+/// device info. Combines the "is it ONVIF?" check with the device info query
+/// in a single request to avoid redundant HTTP calls.
+///
+/// Returns `Some(DiscoveredCamera)` if the host is an ONVIF device,
+/// `None` if it's not ONVIF or unreachable.
+async fn probe_onvif_endpoint(
+    client: &reqwest::Client,
+    address: String,
+    onvif_url: String,
+    credentials: Option<(String, String)>,
+) -> Option<DiscoveredCamera> {
+    let unauth_body = get_device_info_request_unauth();
+    let resp = client
+        .post(&onvif_url)
+        .header("Content-Type", "application/soap+xml; charset=utf-8")
+        .body(unauth_body)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?;
+
+    // Check Content-Type first — ONVIF services return XML/SOAP content types
+    let is_xml_response = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.contains("xml") || ct.contains("soap"));
+
+    let xml = resp.text().await.ok()?;
+
+    // Verify this is a real ONVIF response, not an echo of our request.
+    // Some web servers echo the POST body in error pages, which would contain
+    // our SOAP namespaces. A genuine ONVIF response will have XML content-type
+    // AND contain response-specific elements (Fault, Body with response data).
+    let is_onvif = if is_xml_response {
+        looks_like_onvif_soap(&xml)
+    } else {
+        // No XML content-type: only accept if we see ONVIF-response-specific content
+        // that wouldn't appear in our echoed request
+        xml.contains("Fault") || xml.contains("GetDeviceInformationResponse")
+    };
+
+    if !is_onvif {
+        tracing::debug!("{} is not an ONVIF service", onvif_url);
+        return None;
+    }
+
+    // Try to extract device info from the unauthenticated response
+    let manufacturer = extract_xml_elements(&xml, "Manufacturer").into_iter().next();
+    let model = extract_xml_elements(&xml, "Model").into_iter().next();
+
+    if manufacturer.is_some() && model.is_some() {
+        return Some(DiscoveredCamera {
+            address,
+            onvif_url,
+            manufacturer,
+            model,
+            types: vec![],
+        });
+    }
+
+    // Unauthenticated didn't return device info (likely needs auth). Try with credentials.
+    if let Some((username, password)) = credentials {
+        tracing::debug!("retrying {} with digest auth", onvif_url);
+        let digest_body = get_device_info_request_digest(&username, &password);
+        if let Some((mfr, mdl)) = send_device_info_request(client, &onvif_url, &digest_body).await
+        {
+            return Some(DiscoveredCamera {
+                address,
+                onvif_url,
+                manufacturer: Some(mfr),
+                model: Some(mdl),
+                types: vec![],
+            });
+        }
+    }
+
+    // It's ONVIF but we couldn't get device info (auth required, no creds available)
+    Some(DiscoveredCamera {
+        address,
+        onvif_url,
+        manufacturer: None,
+        model: None,
+        types: vec![],
+    })
+}
+
 /// Discover cameras on the local network via WS-Discovery.
 ///
 /// Sends a UDP multicast Probe and waits for ProbeMatch responses for `timeout`
@@ -487,6 +586,140 @@ pub async fn discover_cameras(
                 model,
                 types: types.clone(),
             });
+        }
+    }
+
+    Ok(cameras)
+}
+
+/// Common ONVIF ports to probe when scanning a subnet.
+const ONVIF_PORTS: &[u16] = &[2020, 8000, 80, 8080];
+
+/// Parse a CIDR notation string (e.g. "10.10.20.0/24") into a list of host IPs.
+/// Excludes the network and broadcast addresses.
+fn parse_cidr(cidr: &str) -> Result<Vec<Ipv4Addr>> {
+    let parts: Vec<&str> = cidr.split('/').collect();
+    if parts.len() != 2 {
+        bail!("invalid CIDR notation: expected format like 10.10.20.0/24");
+    }
+
+    let base_ip: Ipv4Addr = parts[0].parse().context("invalid IP address in CIDR")?;
+    let prefix_len: u32 = parts[1].parse().context("invalid prefix length in CIDR")?;
+
+    if prefix_len > 32 {
+        bail!("prefix length must be 0-32, got {}", prefix_len);
+    }
+    if prefix_len < 16 {
+        bail!(
+            "prefix /{} is too broad ({} hosts). Use /16 or narrower.",
+            prefix_len,
+            2u32.pow(32 - prefix_len) - 2
+        );
+    }
+
+    let base: u32 = u32::from(base_ip);
+    let mask: u32 = if prefix_len == 32 {
+        u32::MAX
+    } else {
+        !((1u32 << (32 - prefix_len)) - 1)
+    };
+    let network = base & mask;
+    let host_count = 1u32 << (32 - prefix_len);
+
+    if host_count <= 2 {
+        // /31 or /32: return just the IP(s)
+        return Ok(vec![base_ip]);
+    }
+
+    // Skip network address (first) and broadcast (last)
+    let addrs = (1..host_count - 1)
+        .map(|i| Ipv4Addr::from(network + i))
+        .collect();
+
+    Ok(addrs)
+}
+
+/// Probe a single IP on multiple ONVIF ports via TCP connect.
+/// Returns the first port that accepts a connection, or None.
+async fn probe_onvif_ports(ip: Ipv4Addr, timeout: Duration) -> Option<(Ipv4Addr, u16)> {
+    for &port in ONVIF_PORTS {
+        let addr = SocketAddr::from((ip, port));
+        match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
+            Ok(Ok(_)) => {
+                tracing::debug!("ONVIF port open: {}:{}", ip, port);
+                return Some((ip, port));
+            }
+            _ => continue,
+        }
+    }
+    None
+}
+
+/// Scan a subnet for cameras by TCP-probing common ONVIF ports, then querying
+/// responsive hosts for device information.
+///
+/// Use this for cameras on remote VLANs that multicast WS-Discovery can't reach.
+pub async fn scan_subnet(
+    cidr: &str,
+    timeout: Duration,
+    config: Option<&Config>,
+) -> Result<Vec<DiscoveredCamera>> {
+    let ips = parse_cidr(cidr)?;
+    tracing::info!("scanning {} hosts in {}", ips.len(), cidr);
+
+    // Probe all IPs in parallel with a short per-host TCP timeout.
+    // Use the smaller of 500ms or the user-provided timeout for TCP probes.
+    let probe_timeout = timeout.min(Duration::from_millis(500));
+    let mut handles = Vec::with_capacity(ips.len());
+    for ip in ips {
+        handles.push(tokio::spawn(async move {
+            probe_onvif_ports(ip, probe_timeout).await
+        }));
+    }
+
+    let mut responsive = Vec::new();
+    for handle in handles {
+        if let Ok(Some((ip, port))) = handle.await {
+            responsive.push((ip, port));
+        }
+    }
+
+    tracing::info!("found {} responsive host(s)", responsive.len());
+
+    // Query all responsive hosts in parallel for ONVIF verification + device info
+    let client = reqwest::Client::new();
+    let mut seen = HashSet::new();
+    let mut onvif_handles = Vec::new();
+
+    for (ip, port) in responsive {
+        let addr = ip.to_string();
+        if !seen.insert(addr.clone()) {
+            continue;
+        }
+
+        let onvif_url = format!("http://{}:{}/onvif/device_service", ip, port);
+
+        let credentials = config
+            .and_then(|cfg| {
+                cfg.cameras
+                    .iter()
+                    .find(|c| c.host == addr)
+                    .and_then(|cam| match (cam.username.as_deref(), cam.password.as_deref()) {
+                        (Some(u), Some(p)) => Some((u.to_string(), p.to_string())),
+                        _ => None,
+                    })
+            });
+
+        let client = client.clone();
+        onvif_handles.push(tokio::spawn(async move {
+            probe_onvif_endpoint(&client, addr, onvif_url, credentials).await
+        }));
+    }
+
+    let mut cameras = Vec::new();
+    for handle in onvif_handles {
+        if let Ok(Some(cam)) = handle.await {
+            cameras.push(cam);
         }
     }
 
@@ -585,5 +818,59 @@ mod tests {
         assert!(!body.contains("wsse"));
         assert!(!body.contains("Security"));
         assert!(body.contains("GetDeviceInformation"));
+    }
+
+    #[test]
+    fn looks_like_onvif_soap_detects_real_responses() {
+        // ONVIF auth failure response
+        assert!(looks_like_onvif_soap(
+            r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><s:Fault>NotAuthorized</s:Fault></s:Body></s:Envelope>"#
+        ));
+        // ONVIF success response
+        assert!(looks_like_onvif_soap(
+            r#"<tds:GetDeviceInformationResponse xmlns:tds="http://www.onvif.org/ver10/device/wsdl"></tds:GetDeviceInformationResponse>"#
+        ));
+    }
+
+    #[test]
+    fn looks_like_onvif_soap_rejects_non_onvif() {
+        assert!(!looks_like_onvif_soap("<html><body>Hello</body></html>"));
+        assert!(!looks_like_onvif_soap("404 Not Found"));
+        assert!(!looks_like_onvif_soap(""));
+    }
+
+    #[test]
+    fn parse_cidr_24() {
+        let ips = parse_cidr("10.10.20.0/24").unwrap();
+        assert_eq!(ips.len(), 254);
+        assert_eq!(ips[0], Ipv4Addr::new(10, 10, 20, 1));
+        assert_eq!(ips[253], Ipv4Addr::new(10, 10, 20, 254));
+    }
+
+    #[test]
+    fn parse_cidr_28() {
+        let ips = parse_cidr("192.168.1.0/28").unwrap();
+        assert_eq!(ips.len(), 14);
+        assert_eq!(ips[0], Ipv4Addr::new(192, 168, 1, 1));
+        assert_eq!(ips[13], Ipv4Addr::new(192, 168, 1, 14));
+    }
+
+    #[test]
+    fn parse_cidr_32() {
+        let ips = parse_cidr("10.10.20.5/32").unwrap();
+        assert_eq!(ips.len(), 1);
+        assert_eq!(ips[0], Ipv4Addr::new(10, 10, 20, 5));
+    }
+
+    #[test]
+    fn parse_cidr_rejects_too_broad() {
+        assert!(parse_cidr("10.0.0.0/8").is_err());
+    }
+
+    #[test]
+    fn parse_cidr_rejects_invalid() {
+        assert!(parse_cidr("not-a-cidr").is_err());
+        assert!(parse_cidr("10.10.20.0/33").is_err());
+        assert!(parse_cidr("10.10.20.0").is_err());
     }
 }

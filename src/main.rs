@@ -181,6 +181,10 @@ enum Command {
         /// Only list discovered cameras, don't add them
         #[arg(long)]
         no_add: bool,
+
+        /// Scan a specific subnet via TCP probes (e.g. 10.10.20.0/24)
+        #[arg(long)]
+        subnet: Option<String>,
     },
 
     /// Watch for motion and doorbell events
@@ -577,11 +581,16 @@ async fn run_with(cli: Cli) -> Result<()> {
             ConfigAction::Edit => cmd_config_edit(),
             ConfigAction::Show => cmd_config_show(cli.json, cli.config.as_deref()),
         },
-        Command::Discover { timeout, no_add } => {
+        Command::Discover {
+            timeout,
+            no_add,
+            subnet,
+        } => {
             if no_add {
-                cmd_discover(timeout, cli.json, &config).await
+                cmd_discover(timeout, cli.json, &config, subnet.as_deref()).await
             } else {
-                cmd_add_discover(&config, cli.config.as_deref(), cli.json, timeout).await
+                cmd_add_discover(&config, cli.config.as_deref(), cli.json, timeout, subnet.as_deref())
+                    .await
             }
         }
         Command::Events { camera, watch } => cmd_events(&config, &camera, watch, cli.json).await,
@@ -1513,8 +1522,29 @@ fn print_motion_status(name: &str, status: &MotionStatus, json: bool) {
     }
 }
 
-async fn cmd_discover(timeout: u64, json: bool, config: &config::Config) -> Result<()> {
-    let cameras = discovery::discover_cameras(Duration::from_secs(timeout), Some(config)).await?;
+async fn cmd_discover(
+    timeout: u64,
+    json: bool,
+    config: &config::Config,
+    subnet: Option<&str>,
+) -> Result<()> {
+    let mut cameras =
+        discovery::discover_cameras(Duration::from_secs(timeout), Some(config)).await?;
+
+    if let Some(cidr) = subnet {
+        if !json {
+            println!("Scanning subnet {}...", cidr);
+        }
+        let subnet_cameras =
+            discovery::scan_subnet(cidr, Duration::from_secs(timeout), Some(config)).await?;
+        let seen: std::collections::HashSet<String> =
+            cameras.iter().map(|c| c.address.clone()).collect();
+        for cam in subnet_cameras {
+            if !seen.contains(&cam.address) {
+                cameras.push(cam);
+            }
+        }
+    }
 
     if json {
         println!("{}", serde_json::to_string_pretty(&cameras)?);
@@ -2263,8 +2293,9 @@ async fn cmd_add_discover(
     config_path: Option<&Path>,
     json: bool,
     timeout: u64,
+    subnet: Option<&str>,
 ) -> Result<()> {
-    use crate::discovery::discover_cameras;
+    use crate::discovery::{discover_cameras, scan_subnet};
     use crate::init::{auto_camera_config, infer_camera_type, prompt_for_camera};
 
     let existing_hosts: std::collections::HashSet<&str> =
@@ -2274,8 +2305,23 @@ async fn cmd_add_discover(
         println!("Scanning network for cameras...");
     }
 
-    let discovered =
+    let mut discovered =
         discover_cameras(Duration::from_secs(timeout), Some(config)).await?;
+
+    if let Some(cidr) = subnet {
+        if !json {
+            println!("Scanning subnet {}...", cidr);
+        }
+        let subnet_cameras =
+            scan_subnet(cidr, Duration::from_secs(timeout), Some(config)).await?;
+        let seen: std::collections::HashSet<String> =
+            discovered.iter().map(|c| c.address.clone()).collect();
+        for cam in subnet_cameras {
+            if !seen.contains(&cam.address) {
+                discovered.push(cam);
+            }
+        }
+    }
 
     // Filter out cameras already in config
     let new_cameras: Vec<_> = discovered
