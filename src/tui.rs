@@ -43,8 +43,22 @@ impl FrameGrabber {
         let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(2);
         let (error_tx, error_rx) = tokio::sync::mpsc::channel(4);
         let handle = tokio::spawn(async move {
-            if let Err(e) = crate::rtsp_grab::grab_frames_continuous(&url, frame_tx).await {
-                let _ = error_tx.send(format!("{}", e)).await;
+            match crate::rtsp_grab::grab_frames_continuous(&url, frame_tx).await {
+                Ok(()) => {}
+                Err(e) => {
+                    let msg = format!("{}", e);
+                    // Simplify common error messages
+                    let msg = if msg.contains("Connection refused") {
+                        "Connection refused".to_string()
+                    } else if msg.contains("401") || msg.contains("Unauthorized") {
+                        "Authentication failed".to_string()
+                    } else if msg.contains("timed out") {
+                        "Connection timed out".to_string()
+                    } else {
+                        msg
+                    };
+                    let _ = error_tx.send(msg).await;
+                }
             }
         });
         Self {
@@ -62,16 +76,25 @@ impl FrameGrabber {
         let _ = std::fs::remove_file(&self.frame_path);
     }
 
-    fn poll(&mut self) {
-        // Drain frame channel, keep latest
+    /// Drain channels. Returns the latest JPEG frame if any new frames arrived.
+    fn poll(&mut self) -> Option<Vec<u8>> {
+        let mut latest = None;
         while let Ok(jpeg) = self.frame_rx.try_recv() {
             if std::fs::write(&self.frame_path, &jpeg).is_ok() {
                 self.has_frame = true;
             }
+            latest = Some(jpeg);
         }
-        // Drain error channel
         while let Ok(err) = self.error_rx.try_recv() {
             self.last_error = Some(err);
+        }
+        latest
+    }
+
+    /// Seed the preview with a cached frame so it shows immediately.
+    fn seed_frame(&mut self, jpeg: &[u8]) {
+        if std::fs::write(&self.frame_path, jpeg).is_ok() {
+            self.has_frame = true;
         }
     }
 
@@ -94,6 +117,7 @@ struct App {
     preview_camera: Option<usize>,
     preview_area: Option<Rect>,
     grabber: Option<FrameGrabber>,
+    frame_cache: std::collections::HashMap<usize, Vec<u8>>,
     health_rx: tokio::sync::mpsc::Receiver<Vec<HealthStatus>>,
     health_pending: bool,
     status_message: Option<(String, Instant)>,
@@ -112,6 +136,7 @@ impl App {
             preview_camera: None,
             preview_area: None,
             grabber: None,
+            frame_cache: std::collections::HashMap::new(),
             health_rx,
             health_pending: false,
             status_message: None,
@@ -191,6 +216,23 @@ impl App {
             let rtsp_url = self.cameras[idx].rtsp_url.clone();
             self.preview_camera = Some(idx);
             self.grabber = Some(FrameGrabber::start(idx, &rtsp_url));
+        }
+    }
+
+    fn switch_preview_to_selected(&mut self) {
+        let selected = self.table_state.selected();
+        if selected == self.preview_camera {
+            return;
+        }
+        if let Some(idx) = selected {
+            self.close_preview();
+            let rtsp_url = self.cameras[idx].rtsp_url.clone();
+            self.preview_camera = Some(idx);
+            let mut grabber = FrameGrabber::start(idx, &rtsp_url);
+            if let Some(cached) = self.frame_cache.get(&idx) {
+                grabber.seed_frame(cached);
+            }
+            self.grabber = Some(grabber);
         }
     }
 
@@ -441,6 +483,8 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
             Span::styled("Enter", Style::default().fg(Color::Yellow)),
         ];
         if app.preview_camera.is_some() {
+            footer_spans.push(Span::raw(" stop  "));
+            footer_spans.push(Span::styled("Esc", Style::default().fg(Color::Yellow)));
             footer_spans.push(Span::raw(" close preview"));
         } else {
             footer_spans.push(Span::raw(" preview"));
@@ -554,8 +598,11 @@ pub async fn run_tui(config: &Config, interval: u64) -> Result<()> {
     loop {
         // Check for background health check results
         app.try_recv_health();
-        if let Some(ref mut g) = app.grabber {
-            g.poll();
+        if let Some(ref mut g) = app.grabber
+            && let Some(jpeg) = g.poll()
+            && let Some(idx) = app.preview_camera
+        {
+            app.frame_cache.insert(idx, jpeg);
         }
 
         draw(&mut terminal, &mut app)?;
@@ -591,8 +638,18 @@ pub async fn run_tui(config: &Config, interval: u64) -> Result<()> {
                     spawn_health_check(config, &health_tx);
                     app.health_pending = true;
                 }
-                KeyCode::Down | KeyCode::Char('j') => app.next(),
-                KeyCode::Up | KeyCode::Char('k') => app.previous(),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.next();
+                    if app.preview_camera.is_some() {
+                        app.switch_preview_to_selected();
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.previous();
+                    if app.preview_camera.is_some() {
+                        app.switch_preview_to_selected();
+                    }
+                }
                 KeyCode::Char('s') => {
                     if let Some(idx) = app.table_state.selected() {
                         let cam = &app.cameras[idx];

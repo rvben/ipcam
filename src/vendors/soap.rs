@@ -327,7 +327,13 @@ pub async fn snapshot_with_fallback(
     // Fall back to native RTSP frame grab (retina + openh264)
     let data = crate::rtsp_grab::grab_frame(rtsp_url)
         .await
-        .with_context(|| format!("snapshot failed for camera '{}' at {}", name, host))?;
+        .with_context(|| {
+            format!(
+                "snapshot failed for camera '{}' ({})",
+                name,
+                crate::redact_url(rtsp_url)
+            )
+        })?;
 
     Ok(Snapshot {
         camera_name: name.to_string(),
