@@ -300,7 +300,7 @@ pub async fn fetch_onvif_snapshot(
     Some(bytes.to_vec())
 }
 
-/// Capture a snapshot: try ONVIF GetSnapshotUri first, fall back to ffmpeg RTSP frame grab.
+/// Capture a snapshot: try ONVIF GetSnapshotUri first, fall back to native RTSP frame grab.
 pub async fn snapshot_with_fallback(
     client: &reqwest::Client,
     name: &str,
@@ -312,7 +312,7 @@ pub async fn snapshot_with_fallback(
 ) -> Result<crate::camera::Snapshot> {
     use crate::camera::{ImageFormat, Snapshot};
 
-    // Try ONVIF GetSnapshotUri first (faster, no ffmpeg dependency)
+    // Try ONVIF GetSnapshotUri first (faster, single HTTP request)
     if let Some(data) =
         fetch_onvif_snapshot(client, host, onvif_port, username, password).await
     {
@@ -324,39 +324,10 @@ pub async fn snapshot_with_fallback(
         });
     }
 
-    // Fall back to ffmpeg RTSP frame grab
-    let random_suffix: u32 = rand::random();
-    let tmp = std::env::temp_dir().join(format!("ipcam-{}-{}.jpg", name, random_suffix));
-
-    let output = tokio::process::Command::new("ffmpeg")
-        .args([
-            "-rtsp_transport",
-            "tcp",
-            "-i",
-            rtsp_url,
-            "-frames:v",
-            "1",
-            "-update",
-            "1",
-            "-y",
-        ])
-        .arg(&tmp)
-        .output()
+    // Fall back to native RTSP frame grab (retina + openh264)
+    let data = crate::rtsp_grab::grab_frame(rtsp_url)
         .await
-        .context("failed to run ffmpeg — is it installed?")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "ffmpeg snapshot failed for camera '{}' at {}: {}",
-            name,
-            host,
-            stderr.lines().last().unwrap_or("unknown error")
-        );
-    }
-
-    let data = tokio::fs::read(&tmp).await?;
-    let _ = tokio::fs::remove_file(&tmp).await;
+        .with_context(|| format!("snapshot failed for camera '{}' at {}", name, host))?;
 
     Ok(Snapshot {
         camera_name: name.to_string(),

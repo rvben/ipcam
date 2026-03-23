@@ -2,6 +2,7 @@ mod camera;
 mod config;
 mod discovery;
 mod init;
+mod rtsp_grab;
 mod style;
 mod tui;
 mod vendors;
