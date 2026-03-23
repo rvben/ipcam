@@ -377,10 +377,10 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
         let header_row = Row::new(header_cells).height(1);
 
         let rows = app.cameras.iter().map(|cam| {
-            let (status_text, status_color) = if cam.refreshing {
-                ("...", Color::DarkGray)
-            } else if cam.status.online {
+            let (status_text, status_color) = if cam.status.online {
                 ("●", Color::Green)
+            } else if cam.refreshing {
+                ("●", Color::Yellow)
             } else {
                 ("●", Color::Red)
             };
