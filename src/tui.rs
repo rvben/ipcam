@@ -30,6 +30,9 @@ struct CameraStatus {
 struct FrameGrabber {
     handle: tokio::task::JoinHandle<()>,
     frame_path: PathBuf,
+    started_at: Instant,
+    error_rx: tokio::sync::mpsc::Receiver<String>,
+    last_error: Option<String>,
 }
 
 impl FrameGrabber {
@@ -37,15 +40,43 @@ impl FrameGrabber {
         let frame_path = std::env::temp_dir().join(format!("ipcam_tui_{}.jpg", camera_idx));
         let url = rtsp_url.to_string();
         let path = frame_path.clone();
+        let (error_tx, error_rx) = tokio::sync::mpsc::channel(4);
         let handle = tokio::spawn(async move {
-            grab_frames_loop(&url, &path).await;
+            grab_frames_loop(&url, &path, error_tx).await;
         });
-        Self { handle, frame_path }
+        Self {
+            handle,
+            frame_path,
+            started_at: Instant::now(),
+            error_rx,
+            last_error: None,
+        }
     }
 
     fn shutdown(self) {
         self.handle.abort();
         let _ = std::fs::remove_file(&self.frame_path);
+    }
+
+    fn poll_errors(&mut self) {
+        while let Ok(err) = self.error_rx.try_recv() {
+            self.last_error = Some(err);
+        }
+    }
+
+    fn status_message(&self) -> &str {
+        if self.frame_path.exists() {
+            return "";
+        }
+        if let Some(ref err) = self.last_error {
+            return err;
+        }
+        let elapsed = self.started_at.elapsed().as_secs();
+        if elapsed >= 10 {
+            "Connection timed out"
+        } else {
+            "Connecting..."
+        }
     }
 }
 
@@ -215,11 +246,16 @@ fn spawn_health_check(
     });
 }
 
-async fn grab_frames_loop(rtsp_url: &str, output_path: &std::path::Path) {
+async fn grab_frames_loop(
+    rtsp_url: &str,
+    output_path: &std::path::Path,
+    error_tx: tokio::sync::mpsc::Sender<String>,
+) {
+    let mut attempts = 0u32;
     loop {
         // Single long-running ffmpeg process that continuously overwrites the frame.
         // kill_on_drop ensures ffmpeg is killed when the task is aborted.
-        let mut child = match tokio::process::Command::new("ffmpeg")
+        let child = match tokio::process::Command::new("ffmpeg")
             .args([
                 "-rtsp_transport",
                 "tcp",
@@ -235,18 +271,45 @@ async fn grab_frames_loop(rtsp_url: &str, output_path: &std::path::Path) {
             ])
             .arg(output_path.as_os_str())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
         {
             Ok(child) => child,
-            Err(_) => return,
+            Err(e) => {
+                let _ = error_tx.send(format!("ffmpeg not found: {}", e)).await;
+                return;
+            }
         };
 
-        // Wait for process to exit (camera offline, error, etc.)
-        let _ = child.wait().await;
+        let output = child.wait_with_output().await;
+        attempts += 1;
 
-        // Retry after delay
+        if let Ok(ref out) = output
+            && !out.status.success()
+        {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let msg = if stderr.contains("401") {
+                "Authentication failed".to_string()
+            } else if stderr.contains("Connection refused") {
+                "Connection refused".to_string()
+            } else if stderr.contains("timed out") || stderr.contains("timeout") {
+                "Connection timed out".to_string()
+            } else if let Some(line) = stderr.lines().last() {
+                line.trim().to_string()
+            } else {
+                format!("ffmpeg exited with {}", out.status)
+            };
+            let _ = error_tx.send(msg).await;
+        }
+
+        if attempts >= 3 && !output_path.exists() {
+            let _ = error_tx
+                .send("Failed after 3 attempts".to_string())
+                .await;
+            return;
+        }
+
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
 }
@@ -459,16 +522,24 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
                 .as_ref()
                 .is_some_and(|g| g.frame_path.exists());
 
+            let status_msg = app
+                .grabber
+                .as_ref()
+                .map(|g| g.status_message().to_string())
+                .unwrap_or_default();
+
             let block = Block::default()
                 .borders(Borders::ALL)
                 .title(format!(" {} - Live ", cam_name));
             let inner = block.inner(rect);
             frame.render_widget(block, rect);
 
-            if !has_frame {
-                let msg = Paragraph::new("Connecting...")
+            if !has_frame && !status_msg.is_empty() {
+                let is_error = status_msg != "Connecting...";
+                let color = if is_error { Color::Red } else { Color::DarkGray };
+                let msg = Paragraph::new(status_msg)
                     .alignment(Alignment::Center)
-                    .style(Style::default().fg(Color::DarkGray));
+                    .style(Style::default().fg(color));
                 frame.render_widget(msg, inner);
             }
 
@@ -545,6 +616,9 @@ pub async fn run_tui(config: &Config, interval: u64) -> Result<()> {
     loop {
         // Check for background health check results
         app.try_recv_health();
+        if let Some(ref mut g) = app.grabber {
+            g.poll_errors();
+        }
 
         draw(&mut terminal, &mut app)?;
 
