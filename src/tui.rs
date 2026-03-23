@@ -62,7 +62,6 @@ struct App {
     status_message: Option<(String, Instant)>,
     status_tx: tokio::sync::mpsc::Sender<String>,
     status_rx: tokio::sync::mpsc::Receiver<String>,
-    player: Option<std::process::Child>,
 }
 
 impl App {
@@ -81,7 +80,6 @@ impl App {
             status_message: None,
             status_tx,
             status_rx,
-            player: None,
         }
     }
 
@@ -439,8 +437,6 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
             Span::raw(" navigate  "),
             Span::styled("s", Style::default().fg(Color::Yellow)),
             Span::raw(" snapshot  "),
-            Span::styled("o", Style::default().fg(Color::Yellow)),
-            Span::raw(" open stream  "),
             Span::styled("Enter", Style::default().fg(Color::Yellow)),
         ];
         if app.preview_camera.is_some() {
@@ -641,56 +637,6 @@ pub async fn run_tui(config: &Config, interval: u64) -> Result<()> {
                         }
                     }
                 }
-                KeyCode::Char('o') => {
-                    if let Some(cam) = app.selected_camera() {
-                        if !cam.status.online {
-                            app.set_status(format!("'{}' is offline", cam.name));
-                        } else if cam.rtsp_url.is_empty() {
-                            app.set_status(format!("No RTSP URL for '{}'", cam.name));
-                        } else {
-                            let url = cam.rtsp_url.clone();
-                            let cam_name = cam.name.clone();
-                            // Kill any existing player before spawning a new one
-                            if let Some(mut child) = app.player.take() {
-                                let _ = child.kill();
-                                let _ = child.wait();
-                            }
-                            // Try common players in order of preference
-                            let opened = std::process::Command::new("mpv")
-                                .arg(&url)
-                                .stdout(std::process::Stdio::null())
-                                .stderr(std::process::Stdio::null())
-                                .spawn()
-                                .or_else(|_| {
-                                    std::process::Command::new("vlc")
-                                        .arg(&url)
-                                        .stdout(std::process::Stdio::null())
-                                        .stderr(std::process::Stdio::null())
-                                        .spawn()
-                                })
-                                .or_else(|_| {
-                                    std::process::Command::new("ffplay")
-                                        .arg(&url)
-                                        .stdout(std::process::Stdio::null())
-                                        .stderr(std::process::Stdio::null())
-                                        .spawn()
-                                });
-                            match opened {
-                                Ok(child) => {
-                                    app.player = Some(child);
-                                    app.set_status(format!(
-                                        "Opened stream for '{}'",
-                                        cam_name
-                                    ));
-                                }
-                                Err(_) => app.set_status(
-                                    "No player found (install mpv, vlc, or ffplay)"
-                                        .to_string(),
-                                ),
-                            }
-                        }
-                    }
-                }
                 _ => {}
             }
             // Force full redraw when preview changed (closed or switched camera)
@@ -710,10 +656,6 @@ pub async fn run_tui(config: &Config, interval: u64) -> Result<()> {
     }
 
     app.close_preview();
-    if let Some(mut child) = app.player.take() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
     restore_terminal();
     Ok(())
 }
