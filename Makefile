@@ -1,4 +1,4 @@
-.PHONY: build release run test lint fmt check clean install completions ci
+.PHONY: build release run test lint fmt check clean install completions ci release-patch release-minor release-major
 
 build:
 	cargo build
@@ -33,3 +33,12 @@ completions:
 	cargo run -- completions fish > completions/ipcam.fish
 
 ci: lint test release
+
+release-patch:
+	vership bump patch
+
+release-minor:
+	vership bump minor
+
+release-major:
+	vership bump major
