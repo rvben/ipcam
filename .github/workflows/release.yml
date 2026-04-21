@@ -11,6 +11,9 @@ env:
 jobs:
   build:
     name: Build ${{ matrix.target }}
+    # Guard: self-hosted runners only execute on trusted events (tag push).
+    # Fork PRs must never dispatch jobs to self-hosted.
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -26,11 +29,11 @@ jobs:
             use_cross: true
 
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: [self-hosted, macOS, ARM64]
             artifact: ipcam-macos-x86_64
 
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: [self-hosted, macOS, ARM64]
             artifact: ipcam-macos-aarch64
 
     steps:
