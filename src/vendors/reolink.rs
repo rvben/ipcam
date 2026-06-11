@@ -56,7 +56,12 @@ impl Camera for ReolinkCamera {
             "param": {}
         }]);
 
-        let resp = self.client.post(&url).json(&body).send().await
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
             .with_context(|| format!("camera '{}' at {} is not reachable", self.name, self.host))?;
         let data: serde_json::Value = resp.json().await?;
 
@@ -75,8 +80,10 @@ impl Camera for ReolinkCamera {
             self.host, self.username, self.password,
         );
 
-        let resp = self.client.get(&url).send().await
-            .with_context(|| format!("camera '{}' at {} is not reachable", self.name, self.host))?;
+        let resp =
+            self.client.get(&url).send().await.with_context(|| {
+                format!("camera '{}' at {} is not reachable", self.name, self.host)
+            })?;
         if !resp.status().is_success() {
             bail!(
                 "snapshot request failed with status {} for camera '{}' at {}",
@@ -114,7 +121,12 @@ impl Camera for ReolinkCamera {
             "param": { "channel": 0 }
         }]);
 
-        let resp = self.client.post(&url).json(&body).send().await
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
             .with_context(|| format!("camera '{}' at {} is not reachable", self.name, self.host))?;
         let data: serde_json::Value = resp.json().await?;
 

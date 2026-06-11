@@ -3,15 +3,15 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::ExecutableCommand;
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
-use ratatui::Terminal;
 
 use crate::camera::{HealthStatus, StreamQuality};
 use crate::config::{CameraConfig, Config, Go2rtcConfig};
@@ -265,10 +265,7 @@ fn build_camera_status(cam_config: &CameraConfig, go2rtc: Option<&Go2rtcConfig>)
 }
 
 /// Spawn a non-blocking health check for all cameras.
-fn spawn_health_check(
-    config: &Config,
-    tx: &tokio::sync::mpsc::Sender<Vec<HealthStatus>>,
-) {
+fn spawn_health_check(config: &Config, tx: &tokio::sync::mpsc::Sender<Vec<HealthStatus>>) {
     let cameras: Vec<_> = config
         .cameras
         .iter()
@@ -356,10 +353,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
         ];
         if let Some(msg) = app.active_status() {
             header_spans.push(Span::raw("  "));
-            header_spans.push(Span::styled(
-                msg,
-                Style::default().fg(Color::Cyan),
-            ));
+            header_spans.push(Span::styled(msg, Style::default().fg(Color::Cyan)));
         }
         let header = Line::from(header_spans);
         frame.render_widget(Paragraph::new(header), main_chunks[0]);
@@ -422,24 +416,26 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
 
         // Detail panel
         if let Some(cam) = app.selected_camera() {
-            let status_label = if cam.status.online { "online" } else { "offline" };
+            let status_label = if cam.status.online {
+                "online"
+            } else {
+                "offline"
+            };
             let status_color = if cam.status.online {
                 Color::Green
             } else {
                 Color::Red
             };
-            let mut details = vec![
-                Line::from(vec![
-                    Span::styled("  Host: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(&cam.host),
-                    Span::raw("    "),
-                    Span::styled("Type: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(&cam.camera_type),
-                    Span::raw("    "),
-                    Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(status_label, Style::default().fg(status_color)),
-                ]),
-            ];
+            let mut details = vec![Line::from(vec![
+                Span::styled("  Host: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(&cam.host),
+                Span::raw("    "),
+                Span::styled("Type: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(&cam.camera_type),
+                Span::raw("    "),
+                Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(status_label, Style::default().fg(status_color)),
+            ])];
             if cam.status.online {
                 details.push(Line::from(vec![
                     Span::styled("  Detail: ", Style::default().fg(Color::DarkGray)),
@@ -499,10 +495,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
                 .map(|c| c.name.as_str())
                 .unwrap_or("Preview");
 
-            let has_frame = app
-                .grabber
-                .as_ref()
-                .is_some_and(|g| g.has_frame);
+            let has_frame = app.grabber.as_ref().is_some_and(|g| g.has_frame);
 
             let status_msg = app
                 .grabber
@@ -518,7 +511,11 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
 
             if !has_frame && !status_msg.is_empty() {
                 let is_error = status_msg != "Connecting...";
-                let color = if is_error { Color::Red } else { Color::DarkGray };
+                let color = if is_error {
+                    Color::Red
+                } else {
+                    Color::DarkGray
+                };
                 let msg = Paragraph::new(status_msg)
                     .alignment(Alignment::Center)
                     .style(Style::default().fg(color));
@@ -665,8 +662,7 @@ pub async fn run_tui(config: &Config, interval: u64) -> Result<()> {
                                     match vendors::create_camera(&cfg, go2rtc.as_ref()) {
                                         Ok(c) => match c.snapshot().await {
                                             Ok(snap) => {
-                                                let ts =
-                                                    chrono::Utc::now().format("%Y%m%d_%H%M%S");
+                                                let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
                                                 let filename = format!(
                                                     "{}_{}.{}",
                                                     name,
@@ -681,10 +677,7 @@ pub async fn run_tui(config: &Config, interval: u64) -> Result<()> {
                                                     }
                                                     Err(e) => {
                                                         let _ = tx
-                                                            .send(format!(
-                                                                "Write failed: {}",
-                                                                e
-                                                            ))
+                                                            .send(format!("Write failed: {}", e))
                                                             .await;
                                                     }
                                                 }
@@ -696,8 +689,7 @@ pub async fn run_tui(config: &Config, interval: u64) -> Result<()> {
                                             }
                                         },
                                         Err(e) => {
-                                            let _ =
-                                                tx.send(format!("Camera error: {}", e)).await;
+                                            let _ = tx.send(format!("Camera error: {}", e)).await;
                                         }
                                     }
                                 }

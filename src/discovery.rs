@@ -312,9 +312,7 @@ fn send_probe(timeout: Duration) -> Result<Vec<String>> {
 fn get_device_info_request_digest(username: &str, password: &str) -> String {
     let nonce_bytes: [u8; 16] = rand::random();
     let nonce_b64 = base64::engine::general_purpose::STANDARD.encode(nonce_bytes);
-    let created = chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string();
+    let created = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     let mut hasher = Sha1::new();
     hasher.update(nonce_bytes);
@@ -468,7 +466,9 @@ async fn probe_onvif_endpoint(
     }
 
     // Try to extract device info from the unauthenticated response
-    let manufacturer = extract_xml_elements(&xml, "Manufacturer").into_iter().next();
+    let manufacturer = extract_xml_elements(&xml, "Manufacturer")
+        .into_iter()
+        .next();
     let model = extract_xml_elements(&xml, "Model").into_iter().next();
 
     if manufacturer.is_some() && model.is_some() {
@@ -485,8 +485,7 @@ async fn probe_onvif_endpoint(
     if let Some((username, password)) = credentials {
         tracing::debug!("retrying {} with digest auth", onvif_url);
         let digest_body = get_device_info_request_digest(&username, &password);
-        if let Some((mfr, mdl)) = send_device_info_request(client, &onvif_url, &digest_body).await
-        {
+        if let Some((mfr, mdl)) = send_device_info_request(client, &onvif_url, &digest_body).await {
             return Some(DiscoveredCamera {
                 address,
                 onvif_url,
@@ -558,17 +557,13 @@ pub async fn discover_cameras(
 
             // Look up credentials from config if available
             let credentials = config
-                .and_then(|cfg| {
-                    cfg.cameras
-                        .iter()
-                        .find(|c| c.host == address)
-                })
-                .and_then(|cam| {
-                    match (cam.username.as_deref(), cam.password.as_deref()) {
+                .and_then(|cfg| cfg.cameras.iter().find(|c| c.host == address))
+                .and_then(
+                    |cam| match (cam.username.as_deref(), cam.password.as_deref()) {
                         (Some(u), Some(p)) => Some((u, p)),
                         _ => None,
-                    }
-                });
+                    },
+                );
 
             let (manufacturer, model) =
                 match get_device_info(&client, &onvif_url, credentials).await {
@@ -699,16 +694,14 @@ pub async fn scan_subnet(
 
         let onvif_url = format!("http://{}:{}/onvif/device_service", ip, port);
 
-        let credentials = config
-            .and_then(|cfg| {
-                cfg.cameras
-                    .iter()
-                    .find(|c| c.host == addr)
-                    .and_then(|cam| match (cam.username.as_deref(), cam.password.as_deref()) {
-                        (Some(u), Some(p)) => Some((u.to_string(), p.to_string())),
-                        _ => None,
-                    })
-            });
+        let credentials = config.and_then(|cfg| {
+            cfg.cameras.iter().find(|c| c.host == addr).and_then(|cam| {
+                match (cam.username.as_deref(), cam.password.as_deref()) {
+                    (Some(u), Some(p)) => Some((u.to_string(), p.to_string())),
+                    _ => None,
+                }
+            })
+        });
 
         let client = client.clone();
         onvif_handles.push(tokio::spawn(async move {

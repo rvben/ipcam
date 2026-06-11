@@ -17,6 +17,14 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use camera::{MotionStatus, PtzDirection, StreamQuality};
 use clap::{CommandFactory, Parser, Subcommand};
+use std::io::IsTerminal as _;
+
+#[derive(Debug, Clone, clap::ValueEnum, PartialEq)]
+enum OutputFormat {
+    Auto,
+    Text,
+    Json,
+}
 
 #[derive(Parser)]
 #[command(name = "ipcam", about = "Manage IP cameras from the command line")]
@@ -25,8 +33,12 @@ struct Cli {
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
-    /// Output as JSON
-    #[arg(long, global = true)]
+    /// Output format (auto emits JSON when stdout is not a TTY)
+    #[arg(long, global = true, default_value = "auto")]
+    format: OutputFormat,
+
+    /// Output as JSON (deprecated: use --output json)
+    #[arg(long, global = true, hide = true)]
     json: bool,
 
     /// Suppress informational output
@@ -37,10 +49,30 @@ struct Cli {
     command: Command,
 }
 
+impl Cli {
+    fn effective_json(&self) -> bool {
+        self.format == OutputFormat::Json
+            || self.json
+            || (!matches!(self.format, OutputFormat::Text) && !std::io::stdout().is_terminal())
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// List configured cameras
-    List,
+    List {
+        /// Maximum number of items to return
+        #[arg(long)]
+        limit: Option<u64>,
+
+        /// Number of items to skip
+        #[arg(long)]
+        offset: Option<u64>,
+
+        /// Comma-separated list of fields to include
+        #[arg(long)]
+        fields: Option<String>,
+    },
 
     /// Get camera info
     Info {
@@ -202,6 +234,18 @@ enum Command {
     Status {
         /// Camera name (omit to check all cameras)
         camera: Option<String>,
+
+        /// Maximum number of items to return
+        #[arg(long)]
+        limit: Option<u64>,
+
+        /// Number of items to skip
+        #[arg(long)]
+        offset: Option<u64>,
+
+        /// Comma-separated list of fields to include
+        #[arg(long)]
+        fields: Option<String>,
     },
 
     /// Control pan/tilt/zoom on a camera
@@ -312,6 +356,12 @@ enum Command {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+
+    /// Print the machine-readable schema for this tool (clispec v0.2)
+    Schema {
+        /// Filter to a specific command name
+        command: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -362,7 +412,7 @@ async fn main() {
     // Pre-parse to check for --json/--quiet before full CLI parsing,
     // so we can suppress tracing output early.
     let cli = Cli::parse();
-    let suppress = cli.json || cli.quiet;
+    let suppress = cli.effective_json() || cli.quiet;
 
     if suppress {
         tracing_subscriber::fmt()
@@ -380,49 +430,112 @@ async fn main() {
             .init();
     }
 
+    let json_mode = cli.effective_json();
     if let Err(err) = run_with(cli).await {
-        print_error(&err);
+        print_error(&err, json_mode);
         std::process::exit(1);
     }
 }
 
-fn print_error(err: &anyhow::Error) {
-    eprintln!("Error: {}", redact_url(&err.to_string()));
-
-    let mut source = err.source();
-    while let Some(cause) = source {
-        eprintln!("  caused by: {}", redact_url(&cause.to_string()));
-        source = cause.source();
-    }
-
+fn error_kind(err: &anyhow::Error) -> &'static str {
     let msg = format!("{err:#}").to_lowercase();
     if msg.contains("connection refused")
         || msg.contains("timed out")
         || msg.contains("no route to host")
         || msg.contains("network unreachable")
     {
-        eprintln!();
-        eprintln!("Hint: Check that the camera is powered on and connected to your network.");
+        "network_error"
     } else if msg.contains("ffmpeg")
         && (msg.contains("no such file or directory") || msg.contains("os error 2"))
     {
-        eprintln!();
-        eprintln!("Hint: ffmpeg is not installed. Install it with:");
-        eprintln!("  brew install ffmpeg    (macOS)");
-        eprintln!("  apt install ffmpeg     (Debian/Ubuntu)");
-        eprintln!("  dnf install ffmpeg     (Fedora)");
+        "dependency_missing"
     } else if msg.contains("401")
         || msg.contains("403")
         || msg.contains("unauthorized")
         || msg.contains("authentication")
         || msg.contains("wrong password")
     {
-        eprintln!();
-        eprintln!("Hint: Check the username and password in your config file.");
+        "auth"
+    } else if msg.contains("no cameras configured") || msg.contains("unconfigured") {
+        "not_configured"
+    } else if msg.contains("no such camera")
+        || msg.contains("camera not found")
+        || msg.contains("not found in config")
+        || (msg.contains("not found") && msg.contains("camera"))
+    {
+        "not_found"
+    } else if msg.contains("already exists") {
+        "conflict"
+    } else {
+        "error"
+    }
+}
+
+fn print_error(err: &anyhow::Error, json_mode: bool) {
+    let kind = error_kind(err);
+    let msg = redact_url(&err.to_string());
+
+    let hint = {
+        let lower = format!("{err:#}").to_lowercase();
+        if lower.contains("connection refused")
+            || lower.contains("timed out")
+            || lower.contains("no route to host")
+            || lower.contains("network unreachable")
+        {
+            Some("Check that the camera is powered on and connected to your network.")
+        } else if lower.contains("ffmpeg")
+            && (lower.contains("no such file or directory") || lower.contains("os error 2"))
+        {
+            Some(
+                "ffmpeg is not installed. Install it with: brew install ffmpeg (macOS) or apt install ffmpeg (Linux)",
+            )
+        } else if lower.contains("401")
+            || lower.contains("403")
+            || lower.contains("unauthorized")
+            || lower.contains("authentication")
+            || lower.contains("wrong password")
+        {
+            Some("Check the username and password in your config file.")
+        } else {
+            None
+        }
+    };
+
+    if !json_mode {
+        eprintln!("Error: {}", msg);
+
+        let mut source = err.source();
+        while let Some(cause) = source {
+            eprintln!("  caused by: {}", redact_url(&cause.to_string()));
+            source = cause.source();
+        }
+
+        if hint.is_some() {
+            eprintln!();
+        }
     }
 
-    if std::env::var("RUST_BACKTRACE").as_deref() == Ok("1")
-        || std::env::var("RUST_BACKTRACE").as_deref() == Ok("full")
+    let envelope = if let Some(h) = hint {
+        serde_json::json!({
+            "error": {
+                "kind": kind,
+                "message": msg,
+                "hint": h,
+            }
+        })
+    } else {
+        serde_json::json!({
+            "error": {
+                "kind": kind,
+                "message": msg,
+            }
+        })
+    };
+    eprintln!("{}", envelope);
+
+    if !json_mode
+        && (std::env::var("RUST_BACKTRACE").as_deref() == Ok("1")
+            || std::env::var("RUST_BACKTRACE").as_deref() == Ok("full"))
     {
         let bt = err.backtrace();
         let bt_str = bt.to_string();
@@ -431,6 +544,307 @@ fn print_error(err: &anyhow::Error) {
             eprintln!("{bt_str}");
         }
     }
+}
+
+fn apply_fields_filter(
+    items: Vec<serde_json::Value>,
+    fields: Option<&str>,
+) -> Vec<serde_json::Value> {
+    match fields {
+        None => items,
+        Some(f) => {
+            let field_names: Vec<&str> = f.split(',').map(|s| s.trim()).collect();
+            items
+                .into_iter()
+                .map(|mut item| {
+                    if let Some(obj) = item.as_object_mut() {
+                        let keys: Vec<String> = obj.keys().cloned().collect();
+                        for k in keys {
+                            if !field_names.contains(&k.as_str()) {
+                                obj.remove(&k);
+                            }
+                        }
+                    }
+                    item
+                })
+                .collect()
+        }
+    }
+}
+
+fn build_schema() -> serde_json::Value {
+    serde_json::json!({
+        "clispec": "0.2",
+        "name": "ipcam",
+        "version": env!("CARGO_PKG_VERSION"),
+        "description": "Manage IP cameras from the command line",
+        "global_args": [
+            {"name": "--format", "type": "string", "enum": ["auto", "text", "json"], "default": "auto", "description": "Output format; auto emits JSON when stdout is not a TTY"},
+            {"name": "--quiet", "type": "boolean", "default": false, "description": "Suppress informational output"},
+            {"name": "--config", "type": "path", "required": false, "description": "Path to config file"}
+        ],
+        "commands": [
+            {
+                "name": "list",
+                "description": "List configured cameras",
+                "mutating": false,
+                "args": [
+                    {"name": "--limit", "type": "integer", "required": false, "description": "Maximum number of items to return"},
+                    {"name": "--offset", "type": "integer", "required": false, "description": "Number of items to skip"},
+                    {"name": "--fields", "type": "string", "required": false, "description": "Comma-separated list of fields to include in output"}
+                ],
+                "output_fields": [
+                    {"name": "name", "type": "string"},
+                    {"name": "type", "type": "string"},
+                    {"name": "host", "type": "string"}
+                ]
+            },
+            {
+                "name": "info",
+                "description": "Get camera info",
+                "mutating": false,
+                "args": [
+                    {"name": "camera", "type": "string", "required": true, "description": "Camera name from config"}
+                ],
+                "output_fields": [
+                    {"name": "name", "type": "string"},
+                    {"name": "host", "type": "string"},
+                    {"name": "model", "type": "string"},
+                    {"name": "firmware", "type": "string"}
+                ]
+            },
+            {
+                "name": "snapshot",
+                "description": "Capture a snapshot from a camera",
+                "mutating": false,
+                "args": [
+                    {"name": "camera", "type": "string", "required": false, "description": "Camera name from config"},
+                    {"name": "--output", "type": "path", "required": false, "description": "Output file path"},
+                    {"name": "--all", "type": "boolean", "default": false, "description": "Snapshot all cameras"},
+                    {"name": "--grid", "type": "boolean", "default": false, "description": "Assemble snapshots into a tiled grid"},
+                    {"name": "--output-dir", "type": "path", "required": false, "description": "Directory for saving snapshots"},
+                    {"name": "--every", "type": "string", "required": false, "description": "Capture repeatedly at this interval"},
+                    {"name": "--label", "type": "boolean", "default": false, "description": "Stamp camera name and timestamp on image"},
+                    {"name": "--preview", "type": "boolean", "default": false, "description": "Display snapshot in terminal after saving"}
+                ],
+                "output_fields": [
+                    {"name": "camera", "type": "string"},
+                    {"name": "file", "type": "string"},
+                    {"name": "size_bytes", "type": "integer"},
+                    {"name": "timestamp", "type": "string"}
+                ]
+            },
+            {
+                "name": "status",
+                "description": "Check which cameras are online",
+                "mutating": false,
+                "args": [
+                    {"name": "camera", "type": "string", "required": false, "description": "Camera name (omit to check all)"},
+                    {"name": "--limit", "type": "integer", "required": false, "description": "Maximum number of items to return"},
+                    {"name": "--offset", "type": "integer", "required": false, "description": "Number of items to skip"},
+                    {"name": "--fields", "type": "string", "required": false, "description": "Comma-separated list of fields to include"}
+                ],
+                "output_fields": [
+                    {"name": "camera", "type": "string"},
+                    {"name": "online", "type": "boolean"},
+                    {"name": "detail", "type": "string"},
+                    {"name": "latency_ms", "type": "integer"}
+                ]
+            },
+            {
+                "name": "add",
+                "description": "Add a camera to the config manually",
+                "mutating": true,
+                "args": [
+                    {"name": "--host", "type": "string", "required": true, "description": "IP address of the camera"},
+                    {"name": "--name", "type": "string", "required": false, "description": "Camera name"},
+                    {"name": "--type", "type": "string", "required": true, "enum": ["tapo", "reolink"], "description": "Camera type"},
+                    {"name": "--username", "type": "string", "default": "admin", "description": "Username"},
+                    {"name": "--password", "type": "string", "required": false, "description": "Password"},
+                    {"name": "--rtsp-port", "type": "integer", "default": 554, "description": "RTSP port"},
+                    {"name": "--go2rtc-stream", "type": "string", "required": false, "description": "go2rtc stream name"}
+                ]
+            },
+            {
+                "name": "remove",
+                "description": "Remove a camera from the config",
+                "mutating": true,
+                "args": [
+                    {"name": "name", "type": "string", "required": true, "description": "Camera name to remove"},
+                    {"name": "--yes", "type": "boolean", "default": false, "description": "Skip confirmation prompt"}
+                ]
+            },
+            {
+                "name": "rename",
+                "description": "Rename a camera in the config file",
+                "mutating": true,
+                "args": [
+                    {"name": "old_name", "type": "string", "required": true},
+                    {"name": "new_name", "type": "string", "required": true}
+                ]
+            },
+            {
+                "name": "ptz",
+                "description": "Control pan/tilt/zoom on a camera",
+                "mutating": true,
+                "args": [
+                    {"name": "camera", "type": "string", "required": true},
+                    {"name": "action", "type": "string", "required": true, "enum": ["left", "right", "up", "down", "stop", "preset", "zoom-in", "zoom-out", "home"]},
+                    {"name": "preset", "type": "integer", "required": false},
+                    {"name": "--speed", "type": "integer", "default": 5}
+                ]
+            },
+            {
+                "name": "record",
+                "description": "Record a clip from a camera",
+                "mutating": true,
+                "args": [
+                    {"name": "camera", "type": "string", "required": true},
+                    {"name": "--output", "type": "path", "required": false},
+                    {"name": "--duration", "type": "integer", "default": 30}
+                ]
+            },
+            {
+                "name": "timelapse",
+                "description": "Capture a timelapse from a camera",
+                "mutating": true,
+                "args": [
+                    {"name": "camera", "type": "string", "required": true},
+                    {"name": "--interval", "type": "string", "default": "30s"},
+                    {"name": "--duration", "type": "string", "default": "1h"},
+                    {"name": "--output", "type": "path", "default": "timelapse.mp4"},
+                    {"name": "--output-dir", "type": "path", "required": false}
+                ]
+            },
+            {
+                "name": "discover",
+                "description": "Discover cameras on the network",
+                "mutating": false,
+                "args": [
+                    {"name": "--timeout", "type": "integer", "default": 5},
+                    {"name": "--no-add", "type": "boolean", "default": false},
+                    {"name": "--subnet", "type": "string[]", "required": false}
+                ]
+            },
+            {
+                "name": "events",
+                "description": "Watch for motion and doorbell events",
+                "mutating": false,
+                "args": [
+                    {"name": "camera", "type": "string", "required": true},
+                    {"name": "--watch", "type": "boolean", "default": false}
+                ]
+            },
+            {
+                "name": "config",
+                "description": "Manage the config file",
+                "mutating": false,
+                "subcommands": [
+                    {"name": "path", "description": "Print config file path", "mutating": false},
+                    {"name": "edit", "description": "Open config in editor", "mutating": true},
+                    {"name": "show", "description": "Print config with passwords masked", "mutating": false},
+                    {"name": "check", "description": "Validate config and check connectivity", "mutating": false}
+                ]
+            },
+            {
+                "name": "completions",
+                "description": "Generate shell completion scripts",
+                "mutating": false,
+                "args": [
+                    {"name": "shell", "type": "string", "required": true, "enum": ["bash", "zsh", "fish", "powershell", "elvish"]}
+                ]
+            },
+            {
+                "name": "init",
+                "description": "Interactively set up the config file",
+                "mutating": true,
+                "args": [
+                    {"name": "--auto", "type": "boolean", "default": false, "description": "Non-interactive: auto-generate config from discovered cameras"}
+                ]
+            },
+            {
+                "name": "watch",
+                "description": "Continuously monitor camera health",
+                "mutating": false,
+                "args": [
+                    {"name": "--interval", "type": "string", "default": "30s"},
+                    {"name": "--exec", "type": "string", "required": false}
+                ]
+            },
+            {
+                "name": "test",
+                "description": "Test a camera's configuration end-to-end",
+                "mutating": false,
+                "args": [
+                    {"name": "camera", "type": "string", "required": false}
+                ]
+            },
+            {
+                "name": "tui",
+                "description": "Live TUI showing all camera statuses",
+                "mutating": false,
+                "args": [
+                    {"name": "--interval", "type": "integer", "default": 5}
+                ]
+            },
+            {
+                "name": "live",
+                "description": "Open a live RTSP stream from a camera",
+                "mutating": false,
+                "args": [
+                    {"name": "camera", "type": "string", "required": true},
+                    {"name": "--quality", "type": "string", "default": "main", "enum": ["main", "sub"]},
+                    {"name": "--window", "type": "boolean", "default": false}
+                ]
+            },
+            {
+                "name": "preview",
+                "description": "Preview a camera snapshot in the terminal",
+                "mutating": false,
+                "args": [
+                    {"name": "camera", "type": "string", "required": true},
+                    {"name": "--sub", "type": "boolean", "default": false}
+                ]
+            },
+            {
+                "name": "stream",
+                "description": "Print the RTSP stream URL for a camera",
+                "mutating": false,
+                "args": [
+                    {"name": "camera", "type": "string", "required": true},
+                    {"name": "--quality", "type": "string", "default": "main"},
+                    {"name": "--output", "type": "path", "required": false},
+                    {"name": "--duration", "type": "integer", "default": 10}
+                ]
+            },
+            {
+                "name": "snapshot-all",
+                "description": "Capture snapshots from all configured cameras in parallel",
+                "mutating": false,
+                "args": [
+                    {"name": "--output-dir", "type": "path", "required": false}
+                ]
+            },
+            {
+                "name": "schema",
+                "description": "Print the machine-readable schema for this tool (clispec v0.2)",
+                "mutating": false,
+                "args": [
+                    {"name": "command", "type": "string", "required": false, "description": "Filter to a specific command name"}
+                ]
+            }
+        ],
+        "errors": [
+            {"kind": "not_configured", "exit_code": 1, "retryable": false, "description": "No cameras configured; run ipcam init"},
+            {"kind": "not_found", "exit_code": 1, "retryable": false, "description": "Camera not found in config"},
+            {"kind": "auth", "exit_code": 1, "retryable": false, "description": "Authentication failed"},
+            {"kind": "network_error", "exit_code": 1, "retryable": true, "description": "Camera unreachable on the network"},
+            {"kind": "dependency_missing", "exit_code": 1, "retryable": false, "description": "Required external tool (e.g. ffmpeg) not installed"},
+            {"kind": "conflict", "exit_code": 1, "retryable": false, "description": "Resource already exists with different configuration"},
+            {"kind": "confirmation_required", "exit_code": 2, "retryable": false, "description": "Destructive operation requires --yes flag"},
+            {"kind": "error", "exit_code": 1, "retryable": false, "description": "Unexpected error"}
+        ]
+    })
 }
 
 /// Redact credentials from an RTSP URL for safe logging/display.
@@ -469,12 +883,28 @@ async fn run_with(cli: Cli) -> Result<()> {
         return init::run_init(auto).await;
     }
 
+    if let Command::Schema { command: filter } = &cli.command {
+        let mut schema = build_schema();
+        if let Some(cmd_filter) = filter
+            && let Some(commands) = schema.get("commands").and_then(|c| c.as_array())
+        {
+            let filtered: Vec<_> = commands
+                .iter()
+                .filter(|c| c.get("name").and_then(|n| n.as_str()) == Some(cmd_filter.as_str()))
+                .cloned()
+                .collect();
+            schema["commands"] = serde_json::json!(filtered);
+        }
+        println!("{}", serde_json::to_string_pretty(&schema)?);
+        return Ok(());
+    }
+
     config::Config::migrate_if_needed()?;
 
     // When no config file exists, give a helpful message for commands that need cameras.
     let needs_cameras = !matches!(
         cli.command,
-        Command::Config { .. } | Command::Discover { .. }
+        Command::Config { .. } | Command::Discover { .. } | Command::Schema { .. }
     );
     if needs_cameras && !config::Config::config_exists()? {
         let path = config::Config::config_path()?;
@@ -486,10 +916,15 @@ async fn run_with(cli: Cli) -> Result<()> {
     }
 
     let config = config::Config::load(cli.config.as_deref())?;
+    let json = cli.effective_json();
 
     match cli.command {
-        Command::List => cmd_list(&config, cli.json),
-        Command::Info { camera } => cmd_info(&config, &camera, cli.json).await,
+        Command::List {
+            limit,
+            offset,
+            fields,
+        } => cmd_list(&config, json, limit, offset, fields.as_deref()),
+        Command::Info { camera } => cmd_info(&config, &camera, json).await,
         Command::Snapshot {
             camera,
             output,
@@ -503,7 +938,7 @@ async fn run_with(cli: Cli) -> Result<()> {
             if grid {
                 cmd_snapshot_grid(&config, output_dir, label).await
             } else if all {
-                cmd_snapshot_all(&config, output_dir, cli.json, label).await
+                cmd_snapshot_all(&config, output_dir, json, label).await
             } else if let Some(interval_str) = every {
                 let name = camera
                     .ok_or_else(|| anyhow::anyhow!("camera name is required when using --every"))?;
@@ -516,7 +951,7 @@ async fn run_with(cli: Cli) -> Result<()> {
                         "camera name is required (or use --all to snapshot all cameras)"
                     )
                 })?;
-                cmd_snapshot(&config, &name, output, label, preview, cli.json).await
+                cmd_snapshot(&config, &name, output, label, preview, json).await
             }
         }
         Command::Live {
@@ -526,19 +961,19 @@ async fn run_with(cli: Cli) -> Result<()> {
         } => cmd_live(&config, &camera, quality, window).await,
         Command::Preview { camera, sub: _ } => cmd_preview(&config, &camera).await,
         Command::SnapshotAll { output_dir } => {
-            cmd_snapshot_all(&config, output_dir, cli.json, false).await
+            cmd_snapshot_all(&config, output_dir, json, false).await
         }
         Command::Stream {
             camera,
             quality,
             output,
             duration,
-        } => cmd_stream(&config, &camera, quality, output, duration, cli.json).await,
+        } => cmd_stream(&config, &camera, quality, output, duration, json).await,
         Command::Record {
             camera,
             output,
             duration,
-        } => cmd_record(&config, &camera, output, duration, cli.json).await,
+        } => cmd_record(&config, &camera, output, duration, json).await,
         Command::Timelapse {
             camera,
             interval,
@@ -551,10 +986,10 @@ async fn run_with(cli: Cli) -> Result<()> {
             cmd_timelapse(&config, &camera, interval, duration, output, output_dir).await
         }
         Command::Config { action } => match action.unwrap_or(ConfigAction::Path) {
-            ConfigAction::Path => cmd_config_path(cli.json),
+            ConfigAction::Path => cmd_config_path(json),
             ConfigAction::Edit => cmd_config_edit(),
-            ConfigAction::Show => cmd_config_show(cli.json, cli.config.as_deref()),
-            ConfigAction::Check => cmd_config_check(&config, cli.json).await,
+            ConfigAction::Show => cmd_config_show(json, cli.config.as_deref()),
+            ConfigAction::Check => cmd_config_check(&config, json).await,
         },
         Command::Discover {
             timeout,
@@ -563,27 +998,43 @@ async fn run_with(cli: Cli) -> Result<()> {
         } => {
             let subnets: Vec<&str> = subnet.iter().map(|s| s.as_str()).collect();
             if no_add {
-                cmd_discover(timeout, cli.json, &config, &subnets).await
+                cmd_discover(timeout, json, &config, &subnets).await
             } else {
-                cmd_add_discover(&config, cli.config.as_deref(), cli.json, timeout, &subnets)
-                    .await
+                cmd_add_discover(&config, cli.config.as_deref(), json, timeout, &subnets).await
             }
         }
-        Command::Events { camera, watch } => cmd_events(&config, &camera, watch, cli.json).await,
-        Command::Status { camera } => cmd_status(&config, camera.as_deref(), cli.json).await,
+        Command::Events { camera, watch } => cmd_events(&config, &camera, watch, json).await,
+        Command::Status {
+            camera,
+            limit,
+            offset,
+            fields,
+        } => {
+            cmd_status(
+                &config,
+                camera.as_deref(),
+                json,
+                limit,
+                offset,
+                fields.as_deref(),
+            )
+            .await
+        }
         Command::Ptz {
             camera,
             action,
             preset,
             speed,
-        } => cmd_ptz(&config, &camera, action, preset, speed, cli.json).await,
+        } => cmd_ptz(&config, &camera, action, preset, speed, json).await,
         Command::Watch { interval, exec } => {
             let interval = parse_duration(&interval)?;
             cmd_watch(&config, interval, exec.as_deref()).await
         }
-        Command::Test { camera } => cmd_test(&config, camera.as_deref(), cli.json).await,
+        Command::Test { camera } => cmd_test(&config, camera.as_deref(), json).await,
         Command::Tui { interval } => tui::run_tui(&config, interval).await,
-        Command::Rename { old_name, new_name } => cmd_rename(&old_name, &new_name, cli.config.as_deref(), cli.json),
+        Command::Rename { old_name, new_name } => {
+            cmd_rename(&old_name, &new_name, cli.config.as_deref(), json)
+        }
         Command::Add {
             host,
             name,
@@ -592,28 +1043,46 @@ async fn run_with(cli: Cli) -> Result<()> {
             password,
             rtsp_port,
             go2rtc_stream,
-        } => cmd_add_direct(&host, name.as_deref(), r#type, &username, password.as_deref(), rtsp_port, go2rtc_stream.as_deref(), cli.config.as_deref(), cli.json),
-        Command::Remove { name, yes } => cmd_remove(&name, yes, cli.config.as_deref(), cli.json),
-        Command::Completions { .. } | Command::Init { .. } => {
+        } => cmd_add_direct(
+            &host,
+            name.as_deref(),
+            r#type,
+            &username,
+            password.as_deref(),
+            rtsp_port,
+            go2rtc_stream.as_deref(),
+            cli.config.as_deref(),
+            json,
+        ),
+        Command::Remove { name, yes } => cmd_remove(&name, yes, cli.config.as_deref(), json),
+        Command::Completions { .. } | Command::Init { .. } | Command::Schema { .. } => {
             unreachable!("handled before config load")
         }
     }
 }
 
-fn cmd_list(config: &config::Config, json: bool) -> Result<()> {
+fn cmd_list(
+    config: &config::Config,
+    json: bool,
+    limit: Option<u64>,
+    offset: Option<u64>,
+    fields: Option<&str>,
+) -> Result<()> {
     if config.cameras.is_empty() {
         if json {
-            println!("[]");
+            println!("{}", serde_json::json!({"items": [], "total": 0}));
         } else {
             let config_path = config::Config::config_path()?;
-            println!("No cameras configured. Run `ipcam init` to discover cameras, or `ipcam add` to add one manually.");
+            println!(
+                "No cameras configured. Run `ipcam init` to discover cameras, or `ipcam add` to add one manually."
+            );
             println!("Config file: {}", config_path.display());
         }
         return Ok(());
     }
 
     if json {
-        let cameras: Vec<_> = config
+        let all_items: Vec<serde_json::Value> = config
             .cameras
             .iter()
             .map(|c| {
@@ -624,7 +1093,22 @@ fn cmd_list(config: &config::Config, json: bool) -> Result<()> {
                 })
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&cameras)?);
+        let total = all_items.len();
+        let offset_val = offset.unwrap_or(0) as usize;
+        let items: Vec<_> = all_items.into_iter().skip(offset_val).collect();
+        let items: Vec<_> = if let Some(lim) = limit {
+            items.into_iter().take(lim as usize).collect()
+        } else {
+            items
+        };
+        let items = apply_fields_filter(items, fields);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "items": items,
+                "total": total,
+            }))?
+        );
     } else {
         println!(
             "{}",
@@ -639,8 +1123,7 @@ fn cmd_list(config: &config::Config, json: bool) -> Result<()> {
 }
 
 async fn cmd_info(config: &config::Config, name: &str, json: bool) -> Result<()> {
-    let cam_config = config
-        .require_camera(name)?;
+    let cam_config = config.require_camera(name)?;
     let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
     let info = cam.info().await?;
 
@@ -706,8 +1189,7 @@ async fn cmd_snapshot(
     preview: bool,
     json: bool,
 ) -> Result<()> {
-    let cam_config = config
-        .require_camera(name)?;
+    let cam_config = config.require_camera(name)?;
     let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
 
     tracing::info!("capturing snapshot from '{}'...", name);
@@ -732,12 +1214,15 @@ async fn cmd_snapshot(
     }
 
     if json {
-        println!("{}", serde_json::json!({
-            "camera": name,
-            "file": path.display().to_string(),
-            "size_bytes": snapshot.data.len(),
-            "timestamp": snapshot.timestamp.to_rfc3339(),
-        }));
+        println!(
+            "{}",
+            serde_json::json!({
+                "camera": name,
+                "file": path.display().to_string(),
+                "size_bytes": snapshot.data.len(),
+                "timestamp": snapshot.timestamp.to_rfc3339(),
+            })
+        );
     } else {
         println!("Saved snapshot to {}", path.display());
     }
@@ -760,8 +1245,7 @@ fn print_image_preview(path: &std::path::Path) -> Result<()> {
 }
 
 async fn cmd_preview(config: &config::Config, name: &str) -> Result<()> {
-    let cam_config = config
-        .require_camera(name)?;
+    let cam_config = config.require_camera(name)?;
     let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
 
     tracing::info!("capturing snapshot from '{}'...", name);
@@ -794,9 +1278,12 @@ async fn cmd_live(
         eprintln!("Opening live stream from '{}' in ffplay...", name);
         let status = tokio::process::Command::new("ffplay")
             .args([
-                "-rtsp_transport", "tcp",
-                "-loglevel", "error",
-                "-window_title", &format!("ipcam - {}", name),
+                "-rtsp_transport",
+                "tcp",
+                "-loglevel",
+                "error",
+                "-window_title",
+                &format!("ipcam - {}", name),
                 &url,
             ])
             .status()
@@ -816,12 +1303,17 @@ async fn cmd_live(
         let grab = async {
             let status = tokio::process::Command::new("ffmpeg")
                 .args([
-                    "-rtsp_transport", "tcp",
-                    "-loglevel", "error",
+                    "-rtsp_transport",
+                    "tcp",
+                    "-loglevel",
+                    "error",
                     "-y",
-                    "-i", &url,
-                    "-frames:v", "1",
-                    "-update", "1",
+                    "-i",
+                    &url,
+                    "-frames:v",
+                    "1",
+                    "-update",
+                    "1",
                 ])
                 .arg(temp_path.as_os_str())
                 .stdout(std::process::Stdio::null())
@@ -829,10 +1321,13 @@ async fn cmd_live(
                 .status()
                 .await;
 
-            if let Ok(s) = status && s.success() && temp_path.exists() {
-                    // Clear screen and move cursor to top-left to overwrite previous frame
-                    print!("\x1b[H\x1b[2J");
-                    let _ = print_image_preview(&temp_path);
+            if let Ok(s) = status
+                && s.success()
+                && temp_path.exists()
+            {
+                // Clear screen and move cursor to top-left to overwrite previous frame
+                print!("\x1b[H\x1b[2J");
+                let _ = print_image_preview(&temp_path);
             }
         };
 
@@ -857,7 +1352,9 @@ async fn cmd_snapshot_all(
         if json {
             println!("{}", serde_json::json!({"successes": [], "failures": []}));
         } else {
-            println!("No cameras configured. Run `ipcam init` to discover cameras, or `ipcam add` to add one manually.");
+            println!(
+                "No cameras configured. Run `ipcam init` to discover cameras, or `ipcam add` to add one manually."
+            );
         }
         return Ok(());
     }
@@ -892,10 +1389,8 @@ async fn cmd_snapshot_all(
                         match std::fs::write(&path, &snapshot.data) {
                             Ok(()) => {
                                 if label {
-                                    let display_ts = snapshot
-                                        .timestamp
-                                        .format("%Y-%m-%d %H:%M:%S")
-                                        .to_string();
+                                    let display_ts =
+                                        snapshot.timestamp.format("%Y-%m-%d %H:%M:%S").to_string();
                                     if let Err(e) = apply_label(&path, &name, &display_ts).await {
                                         return (name, Err(e));
                                     }
@@ -973,17 +1468,17 @@ async fn cmd_snapshot_grid(
     label: bool,
 ) -> Result<()> {
     if config.cameras.is_empty() {
-        println!("No cameras configured. Run `ipcam init` to discover cameras, or `ipcam add` to add one manually.");
+        println!(
+            "No cameras configured. Run `ipcam init` to discover cameras, or `ipcam add` to add one manually."
+        );
         return Ok(());
     }
 
     let n = config.cameras.len();
 
     // Capture all cameras in parallel into a temp directory.
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "ipcam-grid-{}",
-        chrono::Utc::now().timestamp()
-    ));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("ipcam-grid-{}", chrono::Utc::now().timestamp()));
     std::fs::create_dir_all(&tmp_dir)
         .with_context(|| format!("creating temp directory: {}", tmp_dir.display()))?;
 
@@ -1073,7 +1568,8 @@ async fn cmd_snapshot_grid(
 
         let status = tokio::process::Command::new("ffmpeg")
             .args([
-                "-loglevel", "error",
+                "-loglevel",
+                "error",
                 "-f",
                 "lavfi",
                 "-i",
@@ -1113,11 +1609,17 @@ async fn cmd_snapshot_grid(
         "[0]copy".to_string()
     } else if rows == 1 {
         // Single row — just hstack
-        let inputs: String = (0..cols).map(|c| format!("[{}]", c)).collect::<Vec<_>>().join("");
+        let inputs: String = (0..cols)
+            .map(|c| format!("[{}]", c))
+            .collect::<Vec<_>>()
+            .join("");
         format!("{}hstack=inputs={}", inputs, cols)
     } else if cols == 1 {
         // Single column — just vstack
-        let inputs: String = (0..rows).map(|r| format!("[{}]", r)).collect::<Vec<_>>().join("");
+        let inputs: String = (0..rows)
+            .map(|r| format!("[{}]", r))
+            .collect::<Vec<_>>()
+            .join("");
         format!("{}vstack=inputs={}", inputs, rows)
     } else {
         let mut f = String::new();
@@ -1149,7 +1651,15 @@ async fn cmd_snapshot_grid(
     for slot in &slots {
         cmd.arg("-i").arg(slot);
     }
-    cmd.args(["-filter_complex", &filter, "-update", "1", "-frames:v", "1", "-y"]);
+    cmd.args([
+        "-filter_complex",
+        &filter,
+        "-update",
+        "1",
+        "-frames:v",
+        "1",
+        "-y",
+    ]);
     cmd.arg(&output_path);
 
     let status = cmd
@@ -1184,8 +1694,7 @@ async fn cmd_stream(
     duration: u64,
     json: bool,
 ) -> Result<()> {
-    let cam_config = config
-        .require_camera(name)?;
+    let cam_config = config.require_camera(name)?;
     let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
     let url = cam.rtsp_url(quality);
 
@@ -1193,20 +1702,26 @@ async fn cmd_stream(
         Some(path) => {
             record_rtsp(&url, &path, duration).await?;
             if json {
-                println!("{}", serde_json::json!({
-                    "camera": name,
-                    "file": path.display().to_string(),
-                }));
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "camera": name,
+                        "file": path.display().to_string(),
+                    })
+                );
             } else {
                 println!("Saved stream to {}", path.display());
             }
         }
         None => {
             if json {
-                println!("{}", serde_json::json!({
-                    "camera": name,
-                    "url": url,
-                }));
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "camera": name,
+                        "url": url,
+                    })
+                );
             } else {
                 println!("{}", url);
             }
@@ -1222,8 +1737,7 @@ async fn cmd_record(
     duration: u64,
     json: bool,
 ) -> Result<()> {
-    let cam_config = config
-        .require_camera(name)?;
+    let cam_config = config.require_camera(name)?;
     let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
     let url = cam.rtsp_url(StreamQuality::Main);
 
@@ -1235,11 +1749,14 @@ async fn cmd_record(
     tracing::info!("recording {}s from '{}'...", duration, name);
     record_rtsp(&url, &path, duration).await?;
     if json {
-        println!("{}", serde_json::json!({
-            "camera": name,
-            "file": path.display().to_string(),
-            "duration_secs": duration,
-        }));
+        println!(
+            "{}",
+            serde_json::json!({
+                "camera": name,
+                "file": path.display().to_string(),
+                "duration_secs": duration,
+            })
+        );
     } else {
         println!("Saved recording to {}", path.display());
     }
@@ -1277,8 +1794,7 @@ async fn cmd_snapshot_watch(
     output_dir: PathBuf,
     interval: Duration,
 ) -> Result<()> {
-    let cam_config = config
-        .require_camera(name)?;
+    let cam_config = config.require_camera(name)?;
     let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
 
     std::fs::create_dir_all(&output_dir)
@@ -1336,8 +1852,7 @@ async fn cmd_timelapse(
     output: PathBuf,
     output_dir: Option<PathBuf>,
 ) -> Result<()> {
-    let cam_config = config
-        .require_camera(name)?;
+    let cam_config = config.require_camera(name)?;
     let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
 
     let (frames_dir, keep_frames) = match output_dir {
@@ -1453,8 +1968,7 @@ async fn stitch_timelapse(frames_dir: &std::path::Path, output: &std::path::Path
 }
 
 async fn cmd_events(config: &config::Config, name: &str, watch: bool, json: bool) -> Result<()> {
-    let cam_config = config
-        .require_camera(name)?;
+    let cam_config = config.require_camera(name)?;
     let cam = vendors::create_camera(cam_config, config.go2rtc.as_ref())?;
 
     if watch {
@@ -1637,11 +2151,17 @@ async fn cmd_ptz(
     Ok(())
 }
 
-async fn cmd_status(config: &config::Config, camera: Option<&str>, json: bool) -> Result<()> {
+async fn cmd_status(
+    config: &config::Config,
+    camera: Option<&str>,
+    json: bool,
+    limit: Option<u64>,
+    offset: Option<u64>,
+    fields: Option<&str>,
+) -> Result<()> {
     let cameras_to_check: Vec<&config::CameraConfig> = match camera {
         Some(name) => {
-            let cam = config
-                .require_camera(name)?;
+            let cam = config.require_camera(name)?;
             vec![cam]
         }
         None => config.cameras.iter().collect(),
@@ -1649,9 +2169,11 @@ async fn cmd_status(config: &config::Config, camera: Option<&str>, json: bool) -
 
     if cameras_to_check.is_empty() {
         if json {
-            println!("[]");
+            println!("{}", serde_json::json!({"items": [], "total": 0}));
         } else {
-            println!("No cameras configured. Run `ipcam init` to discover cameras, or `ipcam add` to add one manually.");
+            println!(
+                "No cameras configured. Run `ipcam init` to discover cameras, or `ipcam add` to add one manually."
+            );
         }
         return Ok(());
     }
@@ -1683,7 +2205,7 @@ async fn cmd_status(config: &config::Config, camera: Option<&str>, json: bool) -
     let results = futures::future::join_all(futures).await;
 
     if json {
-        let entries: Vec<_> = results
+        let all_entries: Vec<serde_json::Value> = results
             .iter()
             .map(|(name, status)| {
                 serde_json::json!({
@@ -1694,7 +2216,22 @@ async fn cmd_status(config: &config::Config, camera: Option<&str>, json: bool) -
                 })
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&entries)?);
+        let total = all_entries.len();
+        let offset_val = offset.unwrap_or(0) as usize;
+        let entries: Vec<_> = all_entries.into_iter().skip(offset_val).collect();
+        let entries: Vec<_> = if let Some(lim) = limit {
+            entries.into_iter().take(lim as usize).collect()
+        } else {
+            entries
+        };
+        let entries = apply_fields_filter(entries, fields);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "items": entries,
+                "total": total,
+            }))?
+        );
     } else {
         println!(
             "{}",
@@ -1732,9 +2269,7 @@ async fn cmd_status(config: &config::Config, camera: Option<&str>, json: bool) -
     Ok(())
 }
 
-async fn poll_all_cameras(
-    config: &config::Config,
-) -> Vec<(String, String, camera::HealthStatus)> {
+async fn poll_all_cameras(config: &config::Config) -> Vec<(String, String, camera::HealthStatus)> {
     let futures: Vec<_> = config
         .cameras
         .iter()
@@ -1765,19 +2300,16 @@ async fn poll_all_cameras(
     futures::future::join_all(futures).await
 }
 
-async fn cmd_watch(
-    config: &config::Config,
-    interval: Duration,
-    exec: Option<&str>,
-) -> Result<()> {
+async fn cmd_watch(config: &config::Config, interval: Duration, exec: Option<&str>) -> Result<()> {
     if config.cameras.is_empty() {
-        println!("No cameras configured. Run `ipcam init` to discover cameras, or `ipcam add` to add one manually.");
+        println!(
+            "No cameras configured. Run `ipcam init` to discover cameras, or `ipcam add` to add one manually."
+        );
         return Ok(());
     }
 
     // Map from camera name to last known online state.
-    let mut last_state: std::collections::HashMap<String, bool> =
-        std::collections::HashMap::new();
+    let mut last_state: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
 
     // Initial poll — print all current states as the startup banner.
     let now = chrono::Local::now();
@@ -1880,10 +2412,13 @@ async fn cmd_watch(
 fn cmd_config_path(json: bool) -> Result<()> {
     let path = config::Config::config_path()?;
     if json {
-        println!("{}", serde_json::json!({
-            "path": path.display().to_string(),
-            "exists": path.exists(),
-        }));
+        println!(
+            "{}",
+            serde_json::json!({
+                "path": path.display().to_string(),
+                "exists": path.exists(),
+            })
+        );
     } else {
         println!("Config path: {}", path.display());
         if path.exists() {
@@ -1948,8 +2483,7 @@ async fn cmd_config_check(config: &config::Config, json: bool) -> Result<()> {
     }
 
     // Check for duplicate hosts
-    let mut seen_hosts: std::collections::HashMap<&str, &str> =
-        std::collections::HashMap::new();
+    let mut seen_hosts: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for cam in &config.cameras {
         if let Some(first_name) = seen_hosts.get(cam.host.as_str()) {
             warnings.push(format!(
@@ -2007,10 +2541,7 @@ async fn cmd_config_check(config: &config::Config, json: bool) -> Result<()> {
     } else {
         let path = config::Config::config_path()?;
         println!("{}", style::bold(&format!("Config: {}", path.display())));
-        println!(
-            "Cameras: {}",
-            config.cameras.len()
-        );
+        println!("Cameras: {}", config.cameras.len());
         println!();
 
         if errors.is_empty() && warnings.is_empty() {
@@ -2054,8 +2585,7 @@ fn cmd_config_show(json: bool, config_path: Option<&Path>) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&cfg)?);
     } else {
-        let toml = toml::to_string_pretty(&cfg)
-            .context("serializing config to TOML")?;
+        let toml = toml::to_string_pretty(&cfg).context("serializing config to TOML")?;
         print!("{toml}");
     }
     Ok(())
@@ -2070,7 +2600,10 @@ struct StepResult {
 }
 
 /// Run all three test steps for one camera and return per-step results.
-async fn test_camera(cam_config: &config::CameraConfig, go2rtc: Option<&config::Go2rtcConfig>) -> [StepResult; 3] {
+async fn test_camera(
+    cam_config: &config::CameraConfig,
+    go2rtc: Option<&config::Go2rtcConfig>,
+) -> [StepResult; 3] {
     // --- Step 1: TCP reachability ---
     let reachable = {
         let start = std::time::Instant::now();
@@ -2082,8 +2615,16 @@ async fn test_camera(cam_config: &config::CameraConfig, go2rtc: Option<&config::
         .await;
         let elapsed = start.elapsed();
         match outcome {
-            Ok(Ok(_)) => StepResult { passed: true, elapsed, message: String::new() },
-            Ok(Err(e)) => StepResult { passed: false, elapsed, message: e.to_string() },
+            Ok(Ok(_)) => StepResult {
+                passed: true,
+                elapsed,
+                message: String::new(),
+            },
+            Ok(Err(e)) => StepResult {
+                passed: false,
+                elapsed,
+                message: e.to_string(),
+            },
             Err(_) => StepResult {
                 passed: false,
                 elapsed,
@@ -2094,34 +2635,49 @@ async fn test_camera(cam_config: &config::CameraConfig, go2rtc: Option<&config::
 
     // --- Step 2: RTSP stream probe via ffprobe ---
     let rtsp = if !reachable.passed {
-        StepResult { passed: false, elapsed: Duration::ZERO, message: "skipped".to_string() }
+        StepResult {
+            passed: false,
+            elapsed: Duration::ZERO,
+            message: "skipped".to_string(),
+        }
     } else {
         let start = std::time::Instant::now();
         let cam = vendors::create_camera(cam_config, go2rtc);
         match cam {
-            Err(e) => StepResult { passed: false, elapsed: start.elapsed(), message: e.to_string() },
+            Err(e) => StepResult {
+                passed: false,
+                elapsed: start.elapsed(),
+                message: e.to_string(),
+            },
             Ok(c) => {
                 let url = c.rtsp_url(StreamQuality::Main);
                 let probe = tokio::time::timeout(
                     Duration::from_secs(5),
                     tokio::process::Command::new("ffprobe")
-                        .args([
-                            "-v", "quiet",
-                            "-rtsp_transport", "tcp",
-                            "-i", &url,
-                        ])
+                        .args(["-v", "quiet", "-rtsp_transport", "tcp", "-i", &url])
                         .output(),
                 )
                 .await;
                 let elapsed = start.elapsed();
                 match probe {
-                    Ok(Ok(out)) if out.status.success() => {
-                        StepResult { passed: true, elapsed, message: String::new() }
-                    }
+                    Ok(Ok(out)) if out.status.success() => StepResult {
+                        passed: true,
+                        elapsed,
+                        message: String::new(),
+                    },
                     Ok(Ok(out)) => {
                         let stderr = String::from_utf8_lossy(&out.stderr);
-                        let detail = stderr.lines().next().unwrap_or("ffprobe failed").trim().to_string();
-                        StepResult { passed: false, elapsed, message: detail }
+                        let detail = stderr
+                            .lines()
+                            .next()
+                            .unwrap_or("ffprobe failed")
+                            .trim()
+                            .to_string();
+                        StepResult {
+                            passed: false,
+                            elapsed,
+                            message: detail,
+                        }
                     }
                     Ok(Err(e)) => StepResult {
                         passed: false,
@@ -2140,18 +2696,34 @@ async fn test_camera(cam_config: &config::CameraConfig, go2rtc: Option<&config::
 
     // --- Step 3: Snapshot ---
     let snapshot = if !reachable.passed {
-        StepResult { passed: false, elapsed: Duration::ZERO, message: "skipped".to_string() }
+        StepResult {
+            passed: false,
+            elapsed: Duration::ZERO,
+            message: "skipped".to_string(),
+        }
     } else {
         let start = std::time::Instant::now();
         let cam = vendors::create_camera(cam_config, go2rtc);
         match cam {
-            Err(e) => StepResult { passed: false, elapsed: start.elapsed(), message: e.to_string() },
+            Err(e) => StepResult {
+                passed: false,
+                elapsed: start.elapsed(),
+                message: e.to_string(),
+            },
             Ok(c) => {
                 let result = tokio::time::timeout(Duration::from_secs(15), c.snapshot()).await;
                 let elapsed = start.elapsed();
                 match result {
-                    Ok(Ok(_)) => StepResult { passed: true, elapsed, message: String::new() },
-                    Ok(Err(e)) => StepResult { passed: false, elapsed, message: e.to_string() },
+                    Ok(Ok(_)) => StepResult {
+                        passed: true,
+                        elapsed,
+                        message: String::new(),
+                    },
+                    Ok(Err(e)) => StepResult {
+                        passed: false,
+                        elapsed,
+                        message: e.to_string(),
+                    },
                     Err(_) => StepResult {
                         passed: false,
                         elapsed,
@@ -2178,8 +2750,7 @@ fn fmt_elapsed(d: Duration) -> String {
 async fn cmd_test(config: &config::Config, camera: Option<&str>, json: bool) -> Result<()> {
     let cameras_to_test: Vec<&config::CameraConfig> = match camera {
         Some(name) => {
-            let cam = config
-                .require_camera(name)?;
+            let cam = config.require_camera(name)?;
             vec![cam]
         }
         None => config.cameras.iter().collect(),
@@ -2189,7 +2760,9 @@ async fn cmd_test(config: &config::Config, camera: Option<&str>, json: bool) -> 
         if json {
             println!("[]");
         } else {
-            println!("No cameras configured. Run `ipcam init` to discover cameras, or `ipcam add` to add one manually.");
+            println!(
+                "No cameras configured. Run `ipcam init` to discover cameras, or `ipcam add` to add one manually."
+            );
         }
         return Ok(());
     }
@@ -2294,7 +2867,10 @@ fn cmd_add_direct(
     };
 
     if config.cameras.iter().any(|c| c.name == resolved_name) {
-        bail!("a camera named '{}' already exists in config", resolved_name);
+        bail!(
+            "a camera named '{}' already exists in config",
+            resolved_name
+        );
     }
 
     if config.cameras.iter().any(|c| c.host == host) {
@@ -2326,8 +2902,7 @@ fn cmd_add_direct(
 
     let path = config::Config::config_path()?;
     let content = toml::to_string_pretty(&config).context("serializing config")?;
-    std::fs::write(&path, content)
-        .with_context(|| format!("writing {}", path.display()))?;
+    std::fs::write(&path, content).with_context(|| format!("writing {}", path.display()))?;
 
     if json {
         println!(
@@ -2367,15 +2942,13 @@ async fn cmd_add_discover(
         println!("Scanning network for cameras...");
     }
 
-    let mut discovered =
-        discover_cameras(Duration::from_secs(timeout), Some(config)).await?;
+    let mut discovered = discover_cameras(Duration::from_secs(timeout), Some(config)).await?;
 
     for cidr in subnets {
         if !json {
             println!("Scanning subnet {}...", cidr);
         }
-        let subnet_cameras =
-            scan_subnet(cidr, Duration::from_secs(timeout), Some(config)).await?;
+        let subnet_cameras = scan_subnet(cidr, Duration::from_secs(timeout), Some(config)).await?;
         let seen: std::collections::HashSet<String> =
             discovered.iter().map(|c| c.address.clone()).collect();
         for cam in subnet_cameras {
@@ -2476,8 +3049,7 @@ async fn cmd_add_discover(
             .map(|p| p.to_path_buf())
             .unwrap_or(config::Config::config_path()?);
         let content = toml::to_string_pretty(&cfg).context("serializing config")?;
-        std::fs::write(&path, content)
-            .with_context(|| format!("writing {}", path.display()))?;
+        std::fs::write(&path, content).with_context(|| format!("writing {}", path.display()))?;
     }
 
     if json {
@@ -2514,25 +3086,37 @@ fn cmd_remove(name: &str, yes: bool, config_path: Option<&Path>, json: bool) -> 
     let cam_type = cam.camera_type.to_string();
     let cam_host = cam.host.clone();
 
-    if !json {
+    if std::io::stdout().is_terminal() {
         println!(
             "Will remove: '{}' ({} @ {})",
             cam.name, cam.camera_type, cam.host
         );
     }
 
-    if !yes && !json {
-        use std::io::Write as _;
-        print!("Confirm removal? [y/N]: ");
-        std::io::stdout().flush().context("flush stdout")?;
-        let mut line = String::new();
-        std::io::stdin()
-            .read_line(&mut line)
-            .context("read from stdin")?;
-        let answer = line.trim().to_lowercase();
-        if answer != "y" && answer != "yes" {
-            println!("Aborted.");
-            return Ok(());
+    if !yes {
+        if !std::io::stdout().is_terminal() {
+            let envelope = serde_json::json!({
+                "error": {
+                    "kind": "confirmation_required",
+                    "message": format!("Removing camera '{}' requires confirmation", name),
+                    "hint": "Re-run with --yes to confirm."
+                }
+            });
+            eprintln!("{}", envelope);
+            std::process::exit(2);
+        } else {
+            use std::io::Write as _;
+            print!("Confirm removal? [y/N]: ");
+            std::io::stdout().flush().context("flush stdout")?;
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .context("read from stdin")?;
+            let answer = line.trim().to_lowercase();
+            if answer != "y" && answer != "yes" {
+                println!("Aborted.");
+                return Ok(());
+            }
         }
     }
 
@@ -2540,8 +3124,7 @@ fn cmd_remove(name: &str, yes: bool, config_path: Option<&Path>, json: bool) -> 
 
     let path = config::Config::config_path()?;
     let content = toml::to_string_pretty(&config).context("serializing config")?;
-    std::fs::write(&path, content)
-        .with_context(|| format!("writing {}", path.display()))?;
+    std::fs::write(&path, content).with_context(|| format!("writing {}", path.display()))?;
 
     if json {
         println!(
@@ -2560,7 +3143,12 @@ fn cmd_remove(name: &str, yes: bool, config_path: Option<&Path>, json: bool) -> 
     Ok(())
 }
 
-fn cmd_rename(old_name: &str, new_name: &str, config_path: Option<&Path>, json: bool) -> Result<()> {
+fn cmd_rename(
+    old_name: &str,
+    new_name: &str,
+    config_path: Option<&Path>,
+    json: bool,
+) -> Result<()> {
     let mut config = config::Config::load(config_path)?;
 
     // Verify old_name exists (require_camera gives a good error message).
@@ -2593,8 +3181,7 @@ fn cmd_rename(old_name: &str, new_name: &str, config_path: Option<&Path>, json: 
 
     let path = config::Config::config_path()?;
     let content = toml::to_string_pretty(&config).context("serializing config")?;
-    std::fs::write(&path, content)
-        .with_context(|| format!("writing {}", path.display()))?;
+    std::fs::write(&path, content).with_context(|| format!("writing {}", path.display()))?;
 
     if json {
         println!(

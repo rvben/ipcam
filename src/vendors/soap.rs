@@ -12,9 +12,7 @@ use crate::discovery::extract_xml_elements;
 pub fn soap_envelope(username: &str, password: &str, body: &str) -> String {
     let nonce_bytes: [u8; 16] = rand::random();
     let nonce_b64 = base64::engine::general_purpose::STANDARD.encode(nonce_bytes);
-    let created = chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string();
+    let created = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     let mut hasher = Sha1::new();
     hasher.update(nonce_bytes);
@@ -120,7 +118,8 @@ pub async fn query_model_name(
   </s:Body>
 </s:Envelope>"#
     );
-    if let Some(result) = send_and_parse_device_info(client, device_service_url, &unauth_body).await {
+    if let Some(result) = send_and_parse_device_info(client, device_service_url, &unauth_body).await
+    {
         return Some(result);
     }
 
@@ -159,11 +158,7 @@ async fn query_model_from_scopes(
     send_and_parse_scopes(client, device_service_url, &auth_body).await
 }
 
-async fn send_and_parse_scopes(
-    client: &reqwest::Client,
-    url: &str,
-    body: &str,
-) -> Option<String> {
+async fn send_and_parse_scopes(client: &reqwest::Client, url: &str, body: &str) -> Option<String> {
     let resp = client
         .post(url)
         .header("Content-Type", "application/soap+xml; charset=utf-8")
@@ -313,9 +308,7 @@ pub async fn snapshot_with_fallback(
     use crate::camera::{ImageFormat, Snapshot};
 
     // Try ONVIF GetSnapshotUri first (faster, single HTTP request)
-    if let Some(data) =
-        fetch_onvif_snapshot(client, host, onvif_port, username, password).await
-    {
+    if let Some(data) = fetch_onvif_snapshot(client, host, onvif_port, username, password).await {
         return Ok(Snapshot {
             camera_name: name.to_string(),
             timestamp: chrono::Utc::now(),
@@ -358,7 +351,11 @@ pub async fn check_reachable(
 ) -> HealthStatus {
     let start = Instant::now();
     let addr = format!("{}:{}", host, rtsp_port);
-    match tokio::time::timeout(Duration::from_secs(3), tokio::net::TcpStream::connect(&addr)).await
+    match tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
     {
         Ok(Ok(_)) => {
             let detail = query_model_name(client, device_service_url, username, password)

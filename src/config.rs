@@ -94,7 +94,6 @@ impl CameraConfig {
             .unwrap_or_default();
         (username, password)
     }
-
 }
 
 fn default_rtsp_port() -> u16 {
@@ -174,11 +173,7 @@ impl Config {
                         .with_context(|| format!("creating directory {}", parent.display()))?;
                 }
                 std::fs::copy(old_path, &new_path).with_context(|| {
-                    format!(
-                        "copying {} to {}",
-                        old_path.display(),
-                        new_path.display()
-                    )
+                    format!("copying {} to {}", old_path.display(), new_path.display())
                 })?;
                 println!(
                     "Migrated config from {} to {}",
@@ -425,10 +420,7 @@ host = "10.0.0.1"
             host: "10.0.0.5".to_string(),
             port: 9000,
         };
-        assert_eq!(
-            go2rtc.rtsp_url("stream1"),
-            "rtsp://10.0.0.5:9000/stream1"
-        );
+        assert_eq!(go2rtc.rtsp_url("stream1"), "rtsp://10.0.0.5:9000/stream1");
     }
 
     // --- config_path ---

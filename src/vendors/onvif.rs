@@ -65,10 +65,7 @@ impl OnvifCamera {
     }
 
     fn ptz_url(&self) -> String {
-        format!(
-            "http://{}:{}/onvif/ptz_service",
-            self.host, self.onvif_port
-        )
+        format!("http://{}:{}/onvif/ptz_service", self.host, self.onvif_port)
     }
 
     fn effective_rtsp_url(&self, quality: StreamQuality) -> String {
@@ -94,7 +91,8 @@ impl OnvifCamera {
 #[async_trait]
 impl Camera for OnvifCamera {
     async fn info(&self) -> Result<CameraInfo> {
-        let body = r#"<tds:GetDeviceInformation xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>"#;
+        let body =
+            r#"<tds:GetDeviceInformation xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>"#;
         let envelope = soap::soap_envelope(&self.onvif_username, &self.onvif_password, body);
 
         let resp = self
@@ -382,10 +380,7 @@ mod tests {
     fn ptz_url_uses_onvif_port() {
         let config = make_onvif_config();
         let cam = OnvifCamera::new(&config, None).unwrap();
-        assert_eq!(
-            cam.ptz_url(),
-            "http://192.168.1.50:80/onvif/ptz_service"
-        );
+        assert_eq!(cam.ptz_url(), "http://192.168.1.50:80/onvif/ptz_service");
     }
 
     #[test]

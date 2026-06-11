@@ -68,11 +68,14 @@ pub async fn grab_frame(rtsp_url: &str) -> Result<Vec<u8>> {
     let video_idx = find_h264_stream(&session)?;
 
     session
-        .setup(video_idx, SetupOptions::default()
-            .transport(retina::client::Transport::Tcp(
-                retina::client::TcpTransportOptions::default(),
-            ))
-            .frame_format(retina::codec::FrameFormat::SIMPLE))
+        .setup(
+            video_idx,
+            SetupOptions::default()
+                .transport(retina::client::Transport::Tcp(
+                    retina::client::TcpTransportOptions::default(),
+                ))
+                .frame_format(retina::codec::FrameFormat::SIMPLE),
+        )
         .await?;
     let session = session.play(retina::client::PlayOptions::default()).await?;
     let mut demuxed = session.demuxed()?;
@@ -145,12 +148,17 @@ async fn stream_frames(
 
     let video_idx = find_h264_stream(&session)?;
 
-    tokio::time::timeout(connect_timeout, session
-        .setup(video_idx, SetupOptions::default()
-            .transport(retina::client::Transport::Tcp(
-                retina::client::TcpTransportOptions::default(),
-            ))
-            .frame_format(retina::codec::FrameFormat::SIMPLE)))
+    tokio::time::timeout(
+        connect_timeout,
+        session.setup(
+            video_idx,
+            SetupOptions::default()
+                .transport(retina::client::Transport::Tcp(
+                    retina::client::TcpTransportOptions::default(),
+                ))
+                .frame_format(retina::codec::FrameFormat::SIMPLE),
+        ),
+    )
     .await
     .map_err(|_| anyhow::anyhow!("setup timed out"))??;
 
@@ -207,7 +215,9 @@ async fn stream_frames(
     }
 }
 
-fn find_h264_stream<S: retina::client::State>(session: &retina::client::Session<S>) -> Result<usize> {
+fn find_h264_stream<S: retina::client::State>(
+    session: &retina::client::Session<S>,
+) -> Result<usize> {
     session
         .streams()
         .iter()
@@ -229,9 +239,8 @@ fn decode_frame_to_jpeg(
     let mut rgb_buf = vec![0u8; w * h * 3];
     yuv.write_rgb8(&mut rgb_buf);
 
-    let img: image::RgbImage =
-        image::ImageBuffer::from_raw(w as u32, h as u32, rgb_buf)
-            .ok_or_else(|| anyhow::anyhow!("failed to create image buffer"))?;
+    let img: image::RgbImage = image::ImageBuffer::from_raw(w as u32, h as u32, rgb_buf)
+        .ok_or_else(|| anyhow::anyhow!("failed to create image buffer"))?;
 
     let mut jpeg_buf = std::io::Cursor::new(Vec::new());
     let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_buf, 80);

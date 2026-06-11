@@ -236,7 +236,6 @@ fn print_summary(config: &Config, path: &std::path::Path) {
     if let Some(g) = &config.go2rtc {
         println!("go2rtc: {}:{}", g.host, g.port);
     }
-
 }
 
 // ── public entry points ───────────────────────────────────────────────────────
@@ -250,7 +249,10 @@ pub async fn run_init(auto: bool) -> Result<()> {
             println!("Use `ipcam discover` to find and add new cameras.");
             return Ok(());
         }
-        let overwrite = ask_yes_no("Start fresh? (No = use `ipcam discover` to add cameras)", false)?;
+        let overwrite = ask_yes_no(
+            "Start fresh? (No = use `ipcam discover` to add cameras)",
+            false,
+        )?;
         if !overwrite {
             println!();
             println!("To add new cameras: ipcam discover");
@@ -300,10 +302,7 @@ pub async fn run_init(auto: bool) -> Result<()> {
 
     let go2rtc = if auto { None } else { prompt_go2rtc()? };
 
-    let config = Config {
-        cameras,
-        go2rtc,
-    };
+    let config = Config { cameras, go2rtc };
 
     write_config(&config, &config_path)?;
     print_summary(&config, &config_path);
