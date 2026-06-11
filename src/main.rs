@@ -34,7 +34,13 @@ struct Cli {
     config: Option<PathBuf>,
 
     /// Output format (auto emits JSON when stdout is not a TTY)
-    #[arg(long, global = true, default_value = "auto")]
+    #[arg(
+        long = "output",
+        short = 'o',
+        visible_alias = "format",
+        global = true,
+        default_value = "auto"
+    )]
     format: OutputFormat,
 
     /// Output as JSON (deprecated: use --output json)
@@ -596,7 +602,7 @@ fn build_schema() -> serde_json::Value {
         "version": env!("CARGO_PKG_VERSION"),
         "description": "Manage IP cameras from the command line",
         "global_args": [
-            {"name": "--format", "type": "string", "enum": ["auto", "text", "json"], "default": "auto", "description": "Output format; auto emits JSON when stdout is not a TTY"},
+            {"name": "--output", "type": "string", "enum": ["auto", "text", "json"], "default": "auto", "description": "Output format; auto emits JSON when stdout is not a TTY (alias: --format, short: -o)"},
             {"name": "--quiet", "type": "boolean", "default": false, "description": "Suppress informational output"},
             {"name": "--config", "type": "path", "required": false, "description": "Path to config file"}
         ],
