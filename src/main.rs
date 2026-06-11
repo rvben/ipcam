@@ -409,9 +409,26 @@ enum ConfigAction {
 
 #[tokio::main]
 async fn main() {
-    // Pre-parse to check for --json/--quiet before full CLI parsing,
-    // so we can suppress tracing output early.
-    let cli = Cli::parse();
+    // Use try_parse so clap errors pass through our structured error handler.
+    let cli = match Cli::try_parse() {
+        Ok(c) => c,
+        Err(e) => {
+            // Print clap's human-readable message for TTY users, then emit
+            // a structured error envelope as the last line of stderr so that
+            // automated consumers can parse it without grepping prose.
+            let exit_code = e.exit_code();
+            e.print().ok();
+            let envelope = serde_json::json!({
+                "error": {
+                    "kind": "error",
+                    "message": "unrecognized argument or subcommand",
+                }
+            });
+            eprintln!("{}", envelope);
+            std::process::exit(exit_code);
+        }
+    };
+
     let suppress = cli.effective_json() || cli.quiet;
 
     if suppress {
