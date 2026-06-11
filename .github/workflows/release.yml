@@ -123,7 +123,7 @@ jobs:
 
       - name: Download release binaries
         env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p binaries
           for artifact in ipcam-macos-aarch64 ipcam-macos-x86_64 ipcam-linux-x86_64; do
@@ -142,9 +142,17 @@ jobs:
 
       - name: Update Homebrew formula
         env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
         run: |
-          git clone https://x-access-token:${GH_TOKEN}@github.com/rvben/homebrew-tap.git
+          # Authenticate to the tap with a write deploy key scoped to
+          # rvben/homebrew-tap. The key does not expire, so cross-repo pushes
+          # keep working without periodic token rotation.
+          mkdir -p ~/.ssh
+          echo "$HOMEBREW_TAP_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+          git clone git@github.com:rvben/homebrew-tap.git
           cd homebrew-tap
 
           VERSION="${{ steps.version.outputs.version }}"
