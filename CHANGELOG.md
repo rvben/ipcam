@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+
+## [0.0.8](https://github.com/rvben/ipcam/compare/v0.0.7...v0.0.8) - 2026-06-20
+
+### Added
+
+- **schema**: enrich output_fields and exit-code accuracy ([1893fab](https://github.com/rvben/ipcam/commit/1893fab0174048f36c25c7506fbe579e2f1bd94e))
+
 ## [0.0.7](https://github.com/rvben/ipcam/compare/v0.0.6...v0.0.7) - 2026-06-11
 
 ### Added
