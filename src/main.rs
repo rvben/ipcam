@@ -686,6 +686,13 @@ fn build_schema() -> serde_json::Value {
                     {"name": "--password", "type": "string", "required": false, "description": "Password"},
                     {"name": "--rtsp-port", "type": "integer", "default": 554, "description": "RTSP port"},
                     {"name": "--go2rtc-stream", "type": "string", "required": false, "description": "go2rtc stream name"}
+                ],
+                "output_fields": [
+                    {"name": "action", "type": "string", "description": "Always 'added'"},
+                    {"name": "camera", "type": "string", "description": "Name assigned to the new camera"},
+                    {"name": "host", "type": "string", "description": "IP address of the added camera"},
+                    {"name": "type", "type": "string", "description": "Camera type (tapo or reolink)"},
+                    {"name": "rtsp_port", "type": "integer", "description": "RTSP port configured for the camera"}
                 ]
             },
             {
@@ -695,6 +702,12 @@ fn build_schema() -> serde_json::Value {
                 "args": [
                     {"name": "name", "type": "string", "required": true, "description": "Camera name to remove"},
                     {"name": "--yes", "type": "boolean", "default": false, "description": "Skip confirmation prompt"}
+                ],
+                "output_fields": [
+                    {"name": "action", "type": "string", "description": "Always 'removed'"},
+                    {"name": "camera", "type": "string", "description": "Name of the removed camera"},
+                    {"name": "host", "type": "string", "description": "Host address of the removed camera"},
+                    {"name": "type", "type": "string", "description": "Camera type of the removed camera"}
                 ]
             },
             {
@@ -704,6 +717,12 @@ fn build_schema() -> serde_json::Value {
                 "args": [
                     {"name": "old_name", "type": "string", "required": true},
                     {"name": "new_name", "type": "string", "required": true}
+                ],
+                "output_fields": [
+                    {"name": "action", "type": "string", "description": "Always 'renamed'"},
+                    {"name": "old_name", "type": "string", "description": "Previous camera name"},
+                    {"name": "new_name", "type": "string", "description": "New camera name"},
+                    {"name": "updated_go2rtc", "type": "boolean", "description": "Whether the go2rtc_stream field was also updated to match the new name"}
                 ]
             },
             {
@@ -715,6 +734,13 @@ fn build_schema() -> serde_json::Value {
                     {"name": "action", "type": "string", "required": true, "enum": ["left", "right", "up", "down", "stop", "preset", "zoom-in", "zoom-out", "home"]},
                     {"name": "preset", "type": "integer", "required": false},
                     {"name": "--speed", "type": "integer", "default": 5}
+                ],
+                "output_fields": [
+                    {"name": "camera", "type": "string", "description": "Camera name"},
+                    {"name": "action", "type": "string", "description": "PTZ action that was executed"},
+                    {"name": "speed", "type": "integer", "description": "Speed value used (1-9)"},
+                    {"name": "success", "type": "boolean", "description": "Whether the action succeeded"},
+                    {"name": "preset", "type": "integer", "description": "Preset number (only present when action is 'preset')"}
                 ]
             },
             {
@@ -725,6 +751,11 @@ fn build_schema() -> serde_json::Value {
                     {"name": "camera", "type": "string", "required": true},
                     {"name": "--output", "type": "path", "required": false},
                     {"name": "--duration", "type": "integer", "default": 30}
+                ],
+                "output_fields": [
+                    {"name": "camera", "type": "string", "description": "Camera name"},
+                    {"name": "file", "type": "string", "description": "Path to the saved recording file"},
+                    {"name": "duration_secs", "type": "integer", "description": "Recorded duration in seconds"}
                 ]
             },
             {
@@ -737,7 +768,8 @@ fn build_schema() -> serde_json::Value {
                     {"name": "--duration", "type": "string", "default": "1h"},
                     {"name": "--output", "type": "path", "default": "timelapse.mp4"},
                     {"name": "--output-dir", "type": "path", "required": false}
-                ]
+                ],
+                "output_fields": []
             },
             {
                 "name": "discover",
@@ -747,6 +779,17 @@ fn build_schema() -> serde_json::Value {
                     {"name": "--timeout", "type": "integer", "default": 5},
                     {"name": "--no-add", "type": "boolean", "default": false},
                     {"name": "--subnet", "type": "string[]", "required": false}
+                ],
+                "output_fields": [
+                    {"name": "discovered", "type": "integer", "description": "Total number of cameras found (default mode, without --no-add)"},
+                    {"name": "new", "type": "integer", "description": "Number of newly discovered cameras not already in config (default mode)"},
+                    {"name": "added", "type": "array", "description": "Cameras auto-added: array of objects with fields name, host, type (default mode)"},
+                    {"name": "skipped", "type": "array", "description": "Cameras skipped (type could not be inferred): objects with fields host, reason, manufacturer (default mode)"},
+                    {"name": "address", "type": "string", "description": "IP address of the camera (--no-add mode, one object per array element)"},
+                    {"name": "onvif_url", "type": "string", "description": "ONVIF service endpoint URL (--no-add mode)"},
+                    {"name": "manufacturer", "type": "string | null", "description": "Camera manufacturer name if detected (--no-add mode)"},
+                    {"name": "model", "type": "string | null", "description": "Camera model name if detected (--no-add mode)"},
+                    {"name": "types", "type": "array", "description": "WS-Discovery device type URNs reported by the camera (--no-add mode)"}
                 ]
             },
             {
@@ -756,6 +799,11 @@ fn build_schema() -> serde_json::Value {
                 "args": [
                     {"name": "camera", "type": "string", "required": true},
                     {"name": "--watch", "type": "boolean", "default": false}
+                ],
+                "output_fields": [
+                    {"name": "camera", "type": "string", "description": "Camera name"},
+                    {"name": "motion_detected", "type": "boolean", "description": "Whether motion is currently detected"},
+                    {"name": "timestamp", "type": "string", "description": "ISO 8601 timestamp of the event (empty string if unknown)"}
                 ]
             },
             {
@@ -763,10 +811,36 @@ fn build_schema() -> serde_json::Value {
                 "description": "Manage the config file",
                 "mutating": false,
                 "subcommands": [
-                    {"name": "path", "description": "Print config file path", "mutating": false},
+                    {
+                        "name": "path",
+                        "description": "Print config file path",
+                        "mutating": false,
+                        "output_fields": [
+                            {"name": "path", "type": "string", "description": "Absolute path to the config file"},
+                            {"name": "exists", "type": "boolean", "description": "Whether the config file exists on disk"}
+                        ]
+                    },
                     {"name": "edit", "description": "Open config in editor", "mutating": true},
-                    {"name": "show", "description": "Print config with passwords masked", "mutating": false},
-                    {"name": "check", "description": "Validate config and check connectivity", "mutating": false}
+                    {
+                        "name": "show",
+                        "description": "Print config with passwords masked",
+                        "mutating": false,
+                        "output_fields": [
+                            {"name": "cameras", "type": "array", "description": "Array of camera config objects with fields: name, type, host, rtsp_port, username, password (masked as ****), go2rtc_stream, onvif_port, main_stream, sub_stream"},
+                            {"name": "go2rtc", "type": "object | null", "description": "Optional go2rtc proxy config with fields: host, port"}
+                        ]
+                    },
+                    {
+                        "name": "check",
+                        "description": "Validate config and check connectivity",
+                        "mutating": false,
+                        "output_fields": [
+                            {"name": "valid", "type": "boolean", "description": "Whether the config passed all validation checks"},
+                            {"name": "errors", "type": "array", "description": "List of error message strings (empty if valid)"},
+                            {"name": "warnings", "type": "array", "description": "List of warning message strings"},
+                            {"name": "cameras", "type": "integer", "description": "Number of cameras in the config"}
+                        ]
+                    }
                 ]
             },
             {
@@ -775,7 +849,8 @@ fn build_schema() -> serde_json::Value {
                 "mutating": false,
                 "args": [
                     {"name": "shell", "type": "string", "required": true, "enum": ["bash", "zsh", "fish", "powershell", "elvish"]}
-                ]
+                ],
+                "output_fields": []
             },
             {
                 "name": "init",
@@ -783,7 +858,8 @@ fn build_schema() -> serde_json::Value {
                 "mutating": true,
                 "args": [
                     {"name": "--auto", "type": "boolean", "default": false, "description": "Non-interactive: auto-generate config from discovered cameras"}
-                ]
+                ],
+                "output_fields": []
             },
             {
                 "name": "watch",
@@ -792,7 +868,8 @@ fn build_schema() -> serde_json::Value {
                 "args": [
                     {"name": "--interval", "type": "string", "default": "30s"},
                     {"name": "--exec", "type": "string", "required": false}
-                ]
+                ],
+                "output_fields": []
             },
             {
                 "name": "test",
@@ -800,6 +877,12 @@ fn build_schema() -> serde_json::Value {
                 "mutating": false,
                 "args": [
                     {"name": "camera", "type": "string", "required": false}
+                ],
+                "output_fields": [
+                    {"name": "camera", "type": "string", "description": "Camera name"},
+                    {"name": "type", "type": "string", "description": "Camera type"},
+                    {"name": "host", "type": "string", "description": "Camera host address"},
+                    {"name": "steps", "type": "object", "description": "Per-step test results with keys 'reachable', 'rtsp_stream', 'snapshot'; each has fields: passed (boolean), elapsed_ms (integer), message (string)"}
                 ]
             },
             {
@@ -808,7 +891,8 @@ fn build_schema() -> serde_json::Value {
                 "mutating": false,
                 "args": [
                     {"name": "--interval", "type": "integer", "default": 5}
-                ]
+                ],
+                "output_fields": []
             },
             {
                 "name": "live",
@@ -818,7 +902,8 @@ fn build_schema() -> serde_json::Value {
                     {"name": "camera", "type": "string", "required": true},
                     {"name": "--quality", "type": "string", "default": "main", "enum": ["main", "sub"]},
                     {"name": "--window", "type": "boolean", "default": false}
-                ]
+                ],
+                "output_fields": []
             },
             {
                 "name": "preview",
@@ -827,7 +912,8 @@ fn build_schema() -> serde_json::Value {
                 "args": [
                     {"name": "camera", "type": "string", "required": true},
                     {"name": "--sub", "type": "boolean", "default": false}
-                ]
+                ],
+                "output_fields": []
             },
             {
                 "name": "stream",
@@ -838,6 +924,11 @@ fn build_schema() -> serde_json::Value {
                     {"name": "--quality", "type": "string", "default": "main"},
                     {"name": "--output", "type": "path", "required": false},
                     {"name": "--duration", "type": "integer", "default": 10}
+                ],
+                "output_fields": [
+                    {"name": "camera", "type": "string", "description": "Camera name"},
+                    {"name": "url", "type": "string", "description": "RTSP stream URL (present when --output is not specified)"},
+                    {"name": "file", "type": "string", "description": "Path to the saved stream file (present when --output is specified)"}
                 ]
             },
             {
@@ -846,6 +937,10 @@ fn build_schema() -> serde_json::Value {
                 "mutating": false,
                 "args": [
                     {"name": "--output-dir", "type": "path", "required": false}
+                ],
+                "output_fields": [
+                    {"name": "successes", "type": "array", "description": "Array of objects with fields: camera (string), path (string) for each successful snapshot"},
+                    {"name": "failures", "type": "array", "description": "Array of objects with fields: camera (string), error (string) for each failed snapshot"}
                 ]
             },
             {
