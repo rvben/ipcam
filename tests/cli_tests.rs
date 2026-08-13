@@ -231,13 +231,13 @@ fn schema_has_required_fields() {
 }
 
 #[test]
-fn schema_validates_against_clispec_v02() {
-    // Load the clispec v0.2 JSON Schema fixture and structurally verify
+fn schema_validates_against_clispec_v03() {
+    // Load the clispec v0.3 JSON Schema fixture and structurally verify
     // that schema output satisfies its required fields.
     let fixture_path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/clispec-v0.2.json");
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/clispec-v0.3.json");
     let fixture_bytes =
-        std::fs::read(&fixture_path).expect("clispec-v0.2.json fixture should exist");
+        std::fs::read(&fixture_path).expect("clispec-v0.3.json fixture should exist");
     let fixture: serde_json::Value =
         serde_json::from_slice(&fixture_bytes).expect("fixture should be valid JSON");
 
@@ -319,8 +319,7 @@ fn structured_error_on_unknown_camera() {
     // The last non-empty line of stderr should be valid JSON with "error" key
     let last_json_line = stderr
         .lines()
-        .filter(|l| !l.trim().is_empty())
-        .last()
+        .rfind(|l| !l.trim().is_empty())
         .expect("should have stderr output");
 
     let parsed: serde_json::Value =
@@ -348,8 +347,7 @@ fn remove_nonexistent_camera_structured_error() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let last_json_line = stderr
         .lines()
-        .filter(|l| !l.trim().is_empty())
-        .last()
+        .rfind(|l| !l.trim().is_empty())
         .expect("should have stderr output");
 
     let parsed: serde_json::Value =

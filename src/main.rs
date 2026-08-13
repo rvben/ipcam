@@ -363,11 +363,14 @@ enum Command {
         yes: bool,
     },
 
-    /// Print the machine-readable schema for this tool (clispec v0.2)
+    /// Print the machine-readable schema for this tool (clispec v0.3)
     Schema {
         /// Filter to a specific command name
         command: Option<String>,
     },
+
+    /// Describe supported camera integrations without loading configuration
+    Capabilities,
 }
 
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -596,8 +599,8 @@ fn apply_fields_filter(
 }
 
 fn build_schema() -> serde_json::Value {
-    serde_json::json!({
-        "clispec": "0.2",
+    let mut schema = serde_json::json!({
+        "clispec": "0.3",
         "name": "ipcam",
         "version": env!("CARGO_PKG_VERSION"),
         "description": "Manage IP cameras from the command line",
@@ -945,10 +948,20 @@ fn build_schema() -> serde_json::Value {
             },
             {
                 "name": "schema",
-                "description": "Print the machine-readable schema for this tool (clispec v0.2)",
+                "description": "Print the machine-readable schema for this tool (clispec v0.3)",
                 "mutating": false,
                 "args": [
                     {"name": "command", "type": "string", "required": false, "description": "Filter to a specific command name"}
+                ]
+            },
+            {
+                "name":"capabilities",
+                "description":"Describe supported camera integrations without loading configuration",
+                "mutating":false,
+                "output_fields":[
+                    {"name":"camera_types","type":"array","items":{"type":"string"}},
+                    {"name":"features","type":"array","items":{"type":"string"}},
+                    {"name":"structured_output","type":"boolean"}
                 ]
             }
         ],
@@ -962,7 +975,125 @@ fn build_schema() -> serde_json::Value {
             {"kind": "confirmation_required", "exit_code": 2, "retryable": false, "description": "Destructive operation requires --yes flag"},
             {"kind": "error", "exit_code": 1, "retryable": false, "description": "Unexpected error"}
         ]
-    })
+    });
+    enrich_v0_3(&mut schema);
+    schema
+}
+
+fn enrich_v0_3(schema: &mut serde_json::Value) {
+    schema["output"] = serde_json::json!({"tty":"text","piped":"json"});
+    let mut flattened = Vec::new();
+    if let Some(commands) = schema["commands"].as_array() {
+        for command in commands {
+            flatten_schema_command(command, "", &mut flattened);
+        }
+    }
+    schema["commands"] = serde_json::Value::Array(flattened);
+    let Some(commands) = schema["commands"].as_array_mut() else {
+        return;
+    };
+    for command in commands {
+        let Some(object) = command.as_object_mut() else {
+            continue;
+        };
+        let name = object["name"].as_str().unwrap_or_default().to_string();
+        if matches!(name.as_str(), "snapshot" | "snapshot-all" | "stream") {
+            object.insert("mutating".into(), serde_json::json!(true));
+        }
+        let mutating = object["mutating"].as_bool().unwrap_or(false);
+        object.insert(
+            "effects".into(),
+            serde_json::json!(if !mutating {
+                "read_only"
+            } else if name == "add" {
+                "non_idempotent"
+            } else {
+                "idempotent"
+            }),
+        );
+        let unbounded = name == "list";
+        object.insert(
+            "cardinality".into(),
+            serde_json::json!(if unbounded { "unbounded" } else { "bounded" }),
+        );
+        if unbounded {
+            object.insert(
+                "pagination".into(),
+                serde_json::json!({"style":"offset","limit_arg":"--limit","offset_arg":"--offset"}),
+            );
+            object.insert("fields_arg".into(), serde_json::json!("--fields"));
+        }
+        if name == "capabilities" {
+            object.insert(
+                "example".into(),
+                serde_json::json!({"args":["capabilities"]}),
+            );
+        }
+        if name == "schema" {
+            object.insert("cardinality".into(), serde_json::json!("single"));
+            object.insert(
+                "stdout_schema".into(),
+                serde_json::json!({"$ref":"https://clispec.dev/schema/v0.3.json"}),
+            );
+        }
+        if name == "remove" {
+            object.insert("confirmation_bypass_arg".into(), serde_json::json!("--yes"));
+        }
+        if let Some(fields) = object
+            .get_mut("output_fields")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for field in fields {
+                if let Some(field) = field.as_object_mut() {
+                    if let Some(base_type) = field
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|value| value.strip_suffix(" | null"))
+                        .map(str::to_owned)
+                    {
+                        field.insert("type".into(), serde_json::json!(base_type));
+                        field.insert("nullable".into(), serde_json::json!(true));
+                    }
+                    if field.get("type").and_then(serde_json::Value::as_str) == Some("array")
+                        && !field.contains_key("items")
+                    {
+                        field.insert("items".into(), serde_json::json!({"type":"object"}));
+                    }
+                }
+            }
+        }
+        if !object.contains_key("output_fields") && !object.contains_key("stdout_schema") {
+            object.insert("stdout_schema".into(), serde_json::json!({}));
+        }
+    }
+}
+
+fn flatten_schema_command(
+    command: &serde_json::Value,
+    prefix: &str,
+    flattened: &mut Vec<serde_json::Value>,
+) {
+    let Some(source) = command.as_object() else {
+        return;
+    };
+    let leaf = source
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let full_name = if prefix.is_empty() {
+        leaf.to_string()
+    } else {
+        format!("{prefix} {leaf}")
+    };
+    let mut flat = source.clone();
+    let children = flat.remove("subcommands");
+    flat.insert("name".into(), serde_json::json!(full_name));
+    flattened.push(serde_json::Value::Object(flat));
+    if let Some(children) = children.and_then(|value| value.as_array().cloned()) {
+        for child in children {
+            flatten_schema_command(&child, &full_name, flattened);
+        }
+    }
 }
 
 /// Redact credentials from an RTSP URL for safe logging/display.
@@ -1017,12 +1148,31 @@ async fn run_with(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
+    if matches!(cli.command, Command::Capabilities) {
+        let value = serde_json::json!({
+            "camera_types": ["tapo", "reolink"],
+            "features": ["snapshots", "streams", "ptz", "recording", "motion", "go2rtc"],
+            "structured_output": true
+        });
+        if cli.effective_json() {
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
+            println!(
+                "Camera types: Tapo, Reolink\nFeatures: snapshots, streams, PTZ, recording, motion, go2rtc"
+            );
+        }
+        return Ok(());
+    }
+
     config::Config::migrate_if_needed()?;
 
     // When no config file exists, give a helpful message for commands that need cameras.
     let needs_cameras = !matches!(
         cli.command,
-        Command::Config { .. } | Command::Discover { .. } | Command::Schema { .. }
+        Command::Config { .. }
+            | Command::Discover { .. }
+            | Command::Schema { .. }
+            | Command::Capabilities
     );
     if needs_cameras && !config::Config::config_exists()? {
         let path = config::Config::config_path()?;
@@ -1173,7 +1323,10 @@ async fn run_with(cli: Cli) -> Result<()> {
             json,
         ),
         Command::Remove { name, yes } => cmd_remove(&name, yes, cli.config.as_deref(), json),
-        Command::Completions { .. } | Command::Init { .. } | Command::Schema { .. } => {
+        Command::Completions { .. }
+        | Command::Init { .. }
+        | Command::Schema { .. }
+        | Command::Capabilities => {
             unreachable!("handled before config load")
         }
     }

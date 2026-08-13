@@ -76,70 +76,6 @@ impl PtzDirection {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn image_format_extension_jpeg() {
-        assert_eq!(ImageFormat::Jpeg.extension(), "jpg");
-    }
-
-    #[test]
-    fn image_format_extension_png() {
-        assert_eq!(ImageFormat::Png.extension(), "png");
-    }
-
-    #[test]
-    fn ptz_velocity_left() {
-        let (pan, tilt) = PtzDirection::Left.velocity(1.0);
-        assert_eq!(pan, -1.0);
-        assert_eq!(tilt, 0.0);
-    }
-
-    #[test]
-    fn ptz_velocity_right() {
-        let (pan, tilt) = PtzDirection::Right.velocity(1.0);
-        assert_eq!(pan, 1.0);
-        assert_eq!(tilt, 0.0);
-    }
-
-    #[test]
-    fn ptz_velocity_up() {
-        let (pan, tilt) = PtzDirection::Up.velocity(1.0);
-        assert_eq!(pan, 0.0);
-        assert_eq!(tilt, 1.0);
-    }
-
-    #[test]
-    fn ptz_velocity_down() {
-        let (pan, tilt) = PtzDirection::Down.velocity(1.0);
-        assert_eq!(pan, 0.0);
-        assert_eq!(tilt, -1.0);
-    }
-
-    #[test]
-    fn ptz_velocity_half_speed() {
-        let (pan, tilt) = PtzDirection::Left.velocity(0.5);
-        assert_eq!(pan, -0.5);
-        assert_eq!(tilt, 0.0);
-    }
-
-    #[test]
-    fn ptz_velocity_clamped_above_one() {
-        let (pan, tilt) = PtzDirection::Right.velocity(5.0);
-        assert_eq!(pan, 1.0);
-        assert_eq!(tilt, 0.0);
-    }
-
-    #[test]
-    fn ptz_velocity_clamped_below_zero() {
-        let (pan, tilt) = PtzDirection::Up.velocity(-2.0);
-        assert_eq!(pan, 0.0);
-        assert_eq!(tilt, 0.0);
-    }
-}
-
 #[async_trait]
 pub trait Camera: Send + Sync {
     /// Get basic info about the camera
@@ -171,4 +107,26 @@ pub trait Camera: Send + Sync {
 
     /// Go to home position
     async fn ptz_home(&self) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_format_extensions() {
+        assert_eq!(ImageFormat::Jpeg.extension(), "jpg");
+        assert_eq!(ImageFormat::Png.extension(), "png");
+    }
+
+    #[test]
+    fn ptz_velocity_directions_and_clamping() {
+        assert_eq!(PtzDirection::Left.velocity(1.0), (-1.0, 0.0));
+        assert_eq!(PtzDirection::Right.velocity(1.0), (1.0, 0.0));
+        assert_eq!(PtzDirection::Up.velocity(1.0), (0.0, 1.0));
+        assert_eq!(PtzDirection::Down.velocity(1.0), (0.0, -1.0));
+        assert_eq!(PtzDirection::Left.velocity(0.5), (-0.5, 0.0));
+        assert_eq!(PtzDirection::Right.velocity(5.0), (1.0, 0.0));
+        assert_eq!(PtzDirection::Up.velocity(-2.0), (0.0, 0.0));
+    }
 }
