@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.0.10](https://github.com/rvben/ipcam/compare/v0.0.9...v0.0.10) - 2026-08-26
+
+### Added
+
+- **tui**: add guided camera credential recovery ([e3bbdf0](https://github.com/rvben/ipcam/commit/e3bbdf040f9412e2154909b5085fff01a94abaa4))
 
 ## [0.0.8](https://github.com/rvben/ipcam/compare/v0.0.7...v0.0.8) - 2026-06-20
 
