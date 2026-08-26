@@ -4,10 +4,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::ExecutableCommand;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+#[cfg(test)]
+use ratatui::backend::TestBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -16,6 +18,13 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 use crate::camera::{HealthStatus, StreamQuality};
 use crate::config::{CameraConfig, Config, Go2rtcConfig};
 use crate::vendors;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TuiExit {
+    Quit,
+    Setup,
+    EditCredentials(String),
+}
 
 struct CameraStatus {
     name: String,
@@ -183,6 +192,21 @@ impl App {
         self.table_state
             .selected()
             .and_then(|i| self.cameras.get(i))
+    }
+
+    fn selected_auth_failed(&self) -> bool {
+        let Some(selected) = self.table_state.selected() else {
+            return false;
+        };
+        self.cameras
+            .get(selected)
+            .is_some_and(|camera| authentication_message(&camera.status.detail))
+            || (self.preview_camera == Some(selected)
+                && self
+                    .grabber
+                    .as_ref()
+                    .and_then(|grabber| grabber.last_error.as_deref())
+                    .is_some_and(authentication_message))
     }
 
     fn next(&mut self) {
@@ -449,6 +473,12 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
                     Span::styled("  Detail: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(&cam.status.detail, Style::default().fg(Color::Red)),
                 ]));
+                if authentication_message(&cam.status.detail) {
+                    details.push(Line::styled(
+                        "  Press e to update this camera’s credentials.",
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
             }
             details.push(Line::from(vec![
                 Span::styled("  RTSP: ", Style::default().fg(Color::DarkGray)),
@@ -467,6 +497,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
         }
 
         // Footer
+        let auth_failed = app.selected_auth_failed();
         let mut footer_spans = vec![
             Span::styled(" q", Style::default().fg(Color::Yellow)),
             Span::raw(" quit  "),
@@ -476,6 +507,12 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
             Span::raw(" navigate  "),
             Span::styled("s", Style::default().fg(Color::Yellow)),
             Span::raw(" snapshot  "),
+            Span::styled("e", Style::default().fg(Color::Yellow)),
+            Span::raw(if auth_failed {
+                " fix credentials  "
+            } else {
+                " credentials  "
+            }),
             Span::styled("Enter", Style::default().fg(Color::Yellow)),
         ];
         if app.preview_camera.is_some() {
@@ -556,22 +593,57 @@ fn restore_terminal() {
     let _ = io::stdout().execute(LeaveAlternateScreen);
 }
 
-pub async fn run_tui(config: &Config, interval: u64) -> Result<()> {
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn enter() -> Result<Self> {
+        terminal::enable_raw_mode()?;
+        if let Err(error) = io::stdout().execute(EnterAlternateScreen) {
+            let _ = terminal::disable_raw_mode();
+            return Err(error.into());
+        }
+        install_panic_hook();
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
+fn install_panic_hook() {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_terminal();
+            previous(info);
+        }));
+    });
+}
+
+fn authentication_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("authentication")
+        || lower.contains("unauthorized")
+        || lower.contains("401")
+        || lower.contains("403")
+        || lower.contains("wrong password")
+        || lower.contains("invalid credential")
+}
+
+pub async fn run_tui(config: &Config, interval: u64) -> Result<TuiExit> {
     if config.cameras.is_empty() {
         anyhow::bail!("no cameras configured");
     }
 
-    terminal::enable_raw_mode()?;
-    io::stdout().execute(EnterAlternateScreen)?;
-
-    let default_panic = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        restore_terminal();
-        default_panic(info);
-    }));
+    let _terminal_guard = TerminalGuard::enter()?;
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
+    let mut exit = TuiExit::Quit;
 
     let (health_tx, health_rx) = tokio::sync::mpsc::channel(1);
     let mut app = App::new(health_rx);
@@ -620,6 +692,7 @@ pub async fn run_tui(config: &Config, interval: u64) -> Result<()> {
             let prev_preview = app.preview_camera;
             match key.code {
                 KeyCode::Char('q') => break,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                 KeyCode::Esc => {
                     if app.preview_camera.is_some() {
                         app.close_preview();
@@ -628,6 +701,12 @@ pub async fn run_tui(config: &Config, interval: u64) -> Result<()> {
                     }
                 }
                 KeyCode::Enter => app.toggle_preview(),
+                KeyCode::Char('e') => {
+                    if let Some(camera) = app.selected_camera() {
+                        exit = TuiExit::EditCredentials(camera.name.clone());
+                        break;
+                    }
+                }
                 KeyCode::Char('r') => {
                     for cam in &mut app.cameras {
                         cam.refreshing = true;
@@ -717,6 +796,114 @@ pub async fn run_tui(config: &Config, interval: u64) -> Result<()> {
     }
 
     app.close_preview();
-    restore_terminal();
-    Ok(())
+    Ok(exit)
+}
+
+pub fn request_setup(reason: &str) -> Result<TuiExit> {
+    let _terminal_guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+    loop {
+        terminal.draw(|frame| draw_setup(frame, reason))?;
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('a') => return Ok(TuiExit::Setup),
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(TuiExit::Quit),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(TuiExit::Quit);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn draw_setup(frame: &mut ratatui::Frame, reason: &str) {
+    let area = frame.area();
+    let width = area.width.saturating_sub(2).clamp(1, 72);
+    let height = area.height.saturating_sub(2).clamp(1, 11);
+    let panel = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    let content = vec![
+        Line::styled(
+            "See your cameras come online",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+        Line::raw(reason),
+        Line::styled(
+            "Guided setup discovers cameras and asks only for the credentials they need.",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("enter / a", Style::default().fg(Color::Yellow)),
+            Span::raw(" start setup   "),
+            Span::styled("q", Style::default().fg(Color::Yellow)),
+            Span::raw(" quit"),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(content)
+            .alignment(Alignment::Center)
+            .wrap(ratatui::widgets::Wrap { trim: true })
+            .block(
+                Block::default()
+                    .title(" CONNECT CAMERAS ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .padding(ratatui::widgets::Padding::horizontal(2)),
+            ),
+        panel,
+    );
+}
+
+#[cfg(test)]
+fn setup_snapshot(width: u16, height: u16, reason: &str) -> String {
+    let backend = TestBackend::new(width.max(48), height.max(16));
+    let mut terminal = Terminal::new(backend).expect("test backend is infallible");
+    terminal
+        .draw(|frame| draw_setup(frame, reason))
+        .expect("test backend is infallible");
+    let buffer = terminal.backend().buffer();
+    let mut output = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            output.push_str(buffer[(x, y)].symbol());
+        }
+        output.push('\n');
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setup_state_offers_a_direct_action_and_exit() {
+        let frame = setup_snapshot(80, 22, "No camera configuration exists yet.");
+        assert!(frame.contains("CONNECT CAMERAS"));
+        assert!(frame.contains("enter / a"));
+        assert!(frame.contains("start setup"));
+        assert!(frame.contains("q quit"));
+    }
+
+    #[test]
+    fn authentication_detection_is_specific_to_credentials() {
+        assert!(authentication_message("401 Unauthorized"));
+        assert!(authentication_message("Authentication failed"));
+        assert!(authentication_message("wrong password"));
+        assert!(!authentication_message("connection timed out"));
+        assert!(!authentication_message("connection refused"));
+    }
 }

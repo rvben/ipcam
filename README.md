@@ -134,6 +134,7 @@ go2rtc_stream = "backyard"
 | `status [camera]` | Check which cameras are online and report latency |
 | `test [camera]` | End-to-end test: network, RTSP URL, snapshot |
 | `watch` | Poll camera health continuously; run a hook on status changes |
+| `tui` | Open the live camera dashboard |
 | `events <camera>` | Show motion detection status; use `--watch` to poll continuously |
 | `ptz <camera> <action>` | Pan/tilt/zoom control: `left`, `right`, `up`, `down`, `stop`, `preset` |
 | `discover` | Scan the network for ONVIF cameras |
@@ -144,6 +145,11 @@ go2rtc_stream = "backyard"
 | `config show` | Print the current config (passwords masked) |
 | `config edit` | Open the config file in `$EDITOR` |
 | `completions <shell>` | Print a shell completion script |
+
+The TUI is also the recovery path. With no cameras configured, press `Enter` or
+`a` to start guided discovery and return directly to the dashboard. Select any
+camera and press `e` to update its password securely; saved values are kept when
+you press Enter, and the dashboard reloads the configuration automatically.
 
 ### Global flags
 

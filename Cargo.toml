@@ -31,6 +31,7 @@ futures = "0.3.32"
 humantime = "2"
 libc = "0.2"
 rand = "0.9"
+rpassword = "7"
 sha1 = "0.10"
 viuer = { version = "0.11", features = ["print-file"] }
 image = "0.25"

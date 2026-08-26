@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -101,11 +102,15 @@ fn default_rtsp_port() -> u16 {
 }
 
 impl Config {
+    pub fn resolved_path(custom_path: Option<&Path>) -> Result<PathBuf> {
+        custom_path
+            .map(Path::to_path_buf)
+            .map(Ok)
+            .unwrap_or_else(Self::config_path)
+    }
+
     pub fn load(custom_path: Option<&Path>) -> Result<Self> {
-        let path = match custom_path {
-            Some(p) => p.to_path_buf(),
-            None => Self::config_path()?,
-        };
+        let path = Self::resolved_path(custom_path)?;
         if !path.exists() {
             return Ok(Self {
                 go2rtc: None,
@@ -115,6 +120,49 @@ impl Config {
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         toml::from_str(&content).with_context(|| format!("parsing {}", path.display()))
+    }
+
+    /// Atomically save credentials in an owner-readable file.
+    pub fn save_to(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating config directory: {}", parent.display()))?;
+        }
+        let body = toml::to_string_pretty(self).context("serialising config to TOML")?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let name = path
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "config.toml".into());
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temporary = parent.join(format!(".{name}.{}.{sequence}.tmp", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let result = (|| -> Result<()> {
+            let mut file = options
+                .open(&temporary)
+                .with_context(|| format!("creating {}", temporary.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            file.write_all(body.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, path)
+                .with_context(|| format!("writing config to {}", path.display()))?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result
     }
 
     pub fn config_path() -> Result<PathBuf> {
@@ -429,6 +477,41 @@ host = "10.0.0.1"
     fn config_path_ends_with_ipcam() {
         let path = Config::config_path().unwrap();
         assert!(path.ends_with("ipcam/config.toml"));
+    }
+
+    #[test]
+    fn save_to_round_trips_without_leaving_a_partial_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("nested/config.toml");
+        let config: Config = toml::from_str(sample_config_toml()).unwrap();
+
+        config.save_to(&path).unwrap();
+
+        let loaded = Config::load(Some(&path)).unwrap();
+        assert_eq!(loaded.cameras.len(), 2);
+        assert_eq!(loaded.cameras[0].password.as_deref(), Some("secret"));
+        let temporary_files = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(temporary_files, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_to_keeps_camera_passwords_owner_readable_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let config: Config = toml::from_str(sample_config_toml()).unwrap();
+
+        config.save_to(&path).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     // --- CameraType Display ---

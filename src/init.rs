@@ -91,6 +91,9 @@ fn prompt_with_default(label: &str, default: &str) -> Result<String> {
 fn prompt_password(label: &str) -> Result<String> {
     print!("{}: ", label);
     io::stdout().flush().context("flush stdout")?;
+    if std::io::IsTerminal::is_terminal(&io::stdin()) {
+        return rpassword::read_password().context("read password from terminal");
+    }
     let mut line = String::new();
     io::stdin()
         .read_line(&mut line)
@@ -207,14 +210,7 @@ fn prompt_go2rtc() -> Result<Option<Go2rtcConfig>> {
 // ── config file writing ───────────────────────────────────────────────────────
 
 fn write_config(config: &Config, path: &std::path::Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating config directory: {}", parent.display()))?;
-    }
-
-    let toml = toml::to_string_pretty(config).context("serialising config to TOML")?;
-    std::fs::write(path, &toml).with_context(|| format!("writing config to {}", path.display()))?;
-    Ok(())
+    config.save_to(path)
 }
 
 // ── print summary ─────────────────────────────────────────────────────────────
@@ -241,9 +237,13 @@ fn print_summary(config: &Config, path: &std::path::Path) {
 // ── public entry points ───────────────────────────────────────────────────────
 
 pub async fn run_init(auto: bool) -> Result<()> {
-    let config_path = Config::config_path()?;
+    run_init_at(auto, None).await
+}
 
-    if config_path.exists() {
+pub async fn run_init_at(auto: bool, custom_path: Option<&std::path::Path>) -> Result<()> {
+    let config_path = Config::resolved_path(custom_path)?;
+
+    if config_path.exists() && !Config::load(Some(&config_path))?.cameras.is_empty() {
         println!("Config already exists at: {}", config_path.display());
         if auto {
             println!("Use `ipcam discover` to find and add new cameras.");
@@ -307,5 +307,65 @@ pub async fn run_init(auto: bool) -> Result<()> {
     write_config(&config, &config_path)?;
     print_summary(&config, &config_path);
 
+    Ok(())
+}
+
+/// Update only the credentials for one camera, preserving every other camera
+/// and advanced stream setting. This is the focused recovery path used by the
+/// TUI when a selected camera rejects its credentials.
+pub fn run_credential_update(
+    camera_name: &str,
+    custom_path: Option<&std::path::Path>,
+) -> Result<()> {
+    let path = Config::resolved_path(custom_path)?;
+    let mut config = Config::load(custom_path)?;
+    let camera = config
+        .cameras
+        .iter_mut()
+        .find(|camera| camera.name == camera_name)
+        .with_context(|| format!("camera '{camera_name}' is no longer configured"))?;
+
+    println!();
+    println!(
+        "Update credentials for '{}' at {}",
+        camera.name, camera.host
+    );
+    println!("Press Enter to keep a saved value.");
+    println!();
+    let username = prompt_with_default("Username", camera.username.as_deref().unwrap_or("admin"))?;
+    let password = prompt_password(if camera.password.is_some() {
+        "Password [saved — Enter keeps it]"
+    } else {
+        "Password"
+    })?;
+    camera.username = (!username.is_empty()).then_some(username);
+    if !password.is_empty() {
+        camera.password = Some(password);
+    }
+
+    if camera.onvif_username.is_some() || camera.onvif_password.is_some() {
+        println!();
+        println!("This camera has separate ONVIF credentials.");
+        let onvif_username = prompt_with_default(
+            "ONVIF username",
+            camera
+                .onvif_username
+                .as_deref()
+                .or(camera.username.as_deref())
+                .unwrap_or("admin"),
+        )?;
+        let onvif_password = prompt_password(if camera.onvif_password.is_some() {
+            "ONVIF password [saved — Enter keeps it]"
+        } else {
+            "ONVIF password"
+        })?;
+        camera.onvif_username = (!onvif_username.is_empty()).then_some(onvif_username);
+        if !onvif_password.is_empty() {
+            camera.onvif_password = Some(onvif_password);
+        }
+    }
+
+    config.save_to(&path)?;
+    println!("Credentials saved securely. Returning to the dashboard…");
     Ok(())
 }

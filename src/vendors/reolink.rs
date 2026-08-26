@@ -18,6 +18,31 @@ pub struct ReolinkCamera {
     client: reqwest::Client,
 }
 
+fn api_response_error(data: &serde_json::Value) -> Option<String> {
+    let response = data.as_array()?.first()?;
+    if response["code"].as_i64()? == 0 {
+        return None;
+    }
+    let detail = response["error"]["detail"]
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| response["error"]["rspCode"].as_str().map(str::to_owned))
+        .or_else(|| {
+            response["error"]["rspCode"]
+                .as_i64()
+                .map(|code| format!("camera rejected the request ({code})"))
+        })
+        .unwrap_or_else(|| "camera rejected the request".into());
+    let lower = detail.to_ascii_lowercase();
+    Some(
+        if lower.contains("login") || lower.contains("password") || lower.contains("auth") {
+            "authentication failed".into()
+        } else {
+            detail
+        },
+    )
+}
+
 impl ReolinkCamera {
     pub fn new(config: &CameraConfig) -> Result<Self> {
         let username = config
@@ -157,9 +182,26 @@ impl Camera for ReolinkCamera {
             .send()
             .await
         {
+            Ok(resp) if matches!(resp.status().as_u16(), 401 | 403) => HealthStatus {
+                online: false,
+                detail: "authentication failed".to_string(),
+                latency: start.elapsed(),
+            },
+            Ok(resp) if !resp.status().is_success() => HealthStatus {
+                online: false,
+                detail: format!("camera returned HTTP {}", resp.status()),
+                latency: start.elapsed(),
+            },
             Ok(resp) => match resp.json::<serde_json::Value>().await {
                 Ok(data) => {
                     let latency = start.elapsed();
+                    if let Some(detail) = api_response_error(&data) {
+                        return HealthStatus {
+                            online: false,
+                            detail,
+                            latency,
+                        };
+                    }
                     let model = data[0]["value"]["DevInfo"]["model"]
                         .as_str()
                         .unwrap_or("unknown model");
@@ -352,5 +394,29 @@ mod tests {
     fn api_url_uses_https() {
         let cam = ReolinkCamera::new(&make_reolink_config()).unwrap();
         assert!(cam.api_url("Snap").starts_with("https://"));
+    }
+
+    #[test]
+    fn rejected_login_is_classified_as_authentication() {
+        let response = serde_json::json!([{
+            "code": 1,
+            "error": { "detail": "login failed" }
+        }]);
+        assert_eq!(
+            api_response_error(&response).as_deref(),
+            Some("authentication failed")
+        );
+    }
+
+    #[test]
+    fn non_authentication_api_errors_keep_the_camera_detail() {
+        let response = serde_json::json!([{
+            "code": 1,
+            "error": { "detail": "operation is not supported" }
+        }]);
+        assert_eq!(
+            api_response_error(&response).as_deref(),
+            Some("operation is not supported")
+        );
     }
 }

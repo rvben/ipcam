@@ -1166,6 +1166,10 @@ async fn run_with(cli: Cli) -> Result<()> {
 
     config::Config::migrate_if_needed()?;
 
+    if let Command::Tui { interval } = &cli.command {
+        return run_tui_command(cli.config.as_deref(), *interval).await;
+    }
+
     // When no config file exists, give a helpful message for commands that need cameras.
     let needs_cameras = !matches!(
         cli.command,
@@ -1255,7 +1259,7 @@ async fn run_with(cli: Cli) -> Result<()> {
         }
         Command::Config { action } => match action.unwrap_or(ConfigAction::Path) {
             ConfigAction::Path => cmd_config_path(json),
-            ConfigAction::Edit => cmd_config_edit(),
+            ConfigAction::Edit => cmd_config_edit(cli.config.as_deref()),
             ConfigAction::Show => cmd_config_show(json, cli.config.as_deref()),
             ConfigAction::Check => cmd_config_check(&config, json).await,
         },
@@ -1299,7 +1303,7 @@ async fn run_with(cli: Cli) -> Result<()> {
             cmd_watch(&config, interval, exec.as_deref()).await
         }
         Command::Test { camera } => cmd_test(&config, camera.as_deref(), json).await,
-        Command::Tui { interval } => tui::run_tui(&config, interval).await,
+        Command::Tui { .. } => unreachable!("TUI commands return before shared config loading"),
         Command::Rename { old_name, new_name } => {
             cmd_rename(&old_name, &new_name, cli.config.as_deref(), json)
         }
@@ -1328,6 +1332,37 @@ async fn run_with(cli: Cli) -> Result<()> {
         | Command::Schema { .. }
         | Command::Capabilities => {
             unreachable!("handled before config load")
+        }
+    }
+}
+
+async fn run_tui_command(custom_path: Option<&Path>, interval: u64) -> Result<()> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!("the TUI requires an interactive terminal on stdin and stdout");
+    }
+
+    loop {
+        let config = config::Config::load(custom_path)?;
+        if config.cameras.is_empty() {
+            let reason = if config::Config::resolved_path(custom_path)?.exists() {
+                "This configuration does not contain any cameras yet."
+            } else {
+                "No camera configuration exists yet."
+            };
+            match tui::request_setup(reason)? {
+                tui::TuiExit::Setup => init::run_init_at(false, custom_path).await?,
+                tui::TuiExit::Quit => return Ok(()),
+                tui::TuiExit::EditCredentials(_) => unreachable!(),
+            }
+            continue;
+        }
+
+        match tui::run_tui(&config, interval).await? {
+            tui::TuiExit::Quit => return Ok(()),
+            tui::TuiExit::Setup => unreachable!(),
+            tui::TuiExit::EditCredentials(camera) => {
+                init::run_credential_update(&camera, custom_path)?;
+            }
         }
     }
 }
@@ -2713,8 +2748,8 @@ fn cmd_config_path(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_config_edit() -> Result<()> {
-    let path = config::Config::config_path()?;
+fn cmd_config_edit(custom_path: Option<&Path>) -> Result<()> {
+    let path = config::Config::resolved_path(custom_path)?;
 
     // Ensure the config directory exists before opening the editor.
     if let Some(parent) = path.parent() {
