@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.0.11](https://github.com/rvben/ipcam/compare/v0.0.10...v0.0.11) - 2026-09-27
+
+### Fixed
+
+- **deps**: update rustls to 0.23.45 for RUSTSEC-2026-0285 ([c631a48](https://github.com/rvben/ipcam/commit/c631a48dca23625ae4c3f32a0c9df51402db6758))
+- **ci**: install pinned Rust components ([00087fc](https://github.com/rvben/ipcam/commit/00087fc6ac4e96c2f41fd312d5d043fe2b50a666))
+
 ## [0.0.10](https://github.com/rvben/ipcam/compare/v0.0.9...v0.0.10) - 2026-08-26
 
 ### Added
