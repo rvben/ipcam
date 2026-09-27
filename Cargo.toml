@@ -27,7 +27,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = { version = "2", features = ["serde"] }
 base64 = "0.22"
-futures = "0.3.32"
+futures = "0.3.34"
 humantime = "2"
 libc = "0.2"
 rand = "0.9"
