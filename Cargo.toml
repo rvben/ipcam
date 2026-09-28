@@ -1,6 +1,6 @@
 [package]
 name = "ipcam"
-version = "0.0.11"
+version = "0.0.12"
 edition = "2024"
 description = "A CLI for managing IP cameras (Tapo, Reolink) via RTSP and vendor APIs"
 license = "MIT"

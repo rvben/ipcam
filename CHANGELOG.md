@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.0.12](https://github.com/rvben/ipcam/compare/v0.0.11...v0.0.12) - 2026-09-28
+
+### Fixed
+
+- **deps**: bump quick-xml, ratatui, and image to clear RUSTSEC advisories ([fabfae1](https://github.com/rvben/ipcam/commit/fabfae11384e42254e82c26712a5d675c0649cd2))
+
 ## [0.0.11](https://github.com/rvben/ipcam/compare/v0.0.10...v0.0.11) - 2026-09-27
 
 ### Fixed
