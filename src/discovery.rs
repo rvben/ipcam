@@ -59,12 +59,12 @@ pub fn extract_xml_elements(xml: &str, local_name: &str) -> Vec<String> {
         match reader.read_event() {
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
                 let name = e.local_name();
-                if name.as_ref() == local_name.as_bytes() {
+                if name.as_ref() == local_name {
                     inside = true;
                 }
             }
             Ok(Event::Text(e)) if inside => {
-                if let Ok(text) = e.unescape() {
+                if let Ok(text) = quick_xml::escape::unescape(e.as_ref()) {
                     let s = text.trim().to_string();
                     if !s.is_empty() {
                         results.push(s);

@@ -1545,7 +1545,9 @@ fn print_image_preview(path: &std::path::Path) -> Result<()> {
         absolute_offset: false,
         ..Default::default()
     };
-    viuer::print_from_file(path, &conf)
+    let img = image::open(path)
+        .with_context(|| format!("failed to load image preview for {}", path.display()))?;
+    viuer::print(&img, &conf)
         .with_context(|| format!("failed to display image preview for {}", path.display()))?;
     Ok(())
 }

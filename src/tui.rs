@@ -581,7 +581,9 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
             restore_cursor: true,
             ..Default::default()
         };
-        let _ = viuer::print_from_file(&grabber.frame_path, &conf);
+        if let Ok(img) = image::open(&grabber.frame_path) {
+            let _ = viuer::print(&img, &conf);
+        }
         let _ = io::stdout().flush();
     }
 
